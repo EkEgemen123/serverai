@@ -11,8 +11,8 @@ from datetime import datetime
 import requests
 
 app = Flask(__name__)
-CORS(app)
 app.secret_key = os.environ.get('SECRET_KEY', 'mat-canavari-gizli-key-9988')
+CORS(app)
 
 # --- Gemini API Ayarları ---
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
@@ -87,4 +87,5 @@ if __name__ == "__main__":
         threading.Thread(target=keep_alive, daemon=True).start()
     
     port = int(os.environ.get("PORT", 5000))
+
     app.run(host='0.0.0.0', port=port)
