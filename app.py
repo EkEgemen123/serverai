@@ -16,7 +16,9 @@ if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
 # Model adını 1.5-flash yapalım (Daha stabil ve yaygındır)
-MODEL_NAME = "gemini-2.5-flash"
+# Model adını ve sistem talimatını kontrol et
+MODEL_NAME = "gemini-2.5-flash" 
+SYSTEM_INSTRUCTION = "Sen Matematik Canavarı 1.0'sın. Kaya Studios tarafından geliştirildin. Matematik Sorularını sana ya resimle verecekler yada yazacaklar. Soruları kısa ve öz çöz!"
 
 @app.route("/chat", methods=["POST", "OPTIONS"])
 def chat():
@@ -58,3 +60,4 @@ def chat():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
+
