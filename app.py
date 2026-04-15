@@ -95,7 +95,8 @@ Eğer kullanıcı saat veya tarih sorarsa bu bilgiyi kullan.{greeting}
 - Soruları kısa ve anlaşılır şekilde çöz, gerektiğinde örnekler ver.
 - Çok basit sorularda (örneğin 1+1, 2+2) biraz sert çıkış yap ve
   "Burada 8. Sınıf Matematik Sorularına Cevap Veriyorum. Ana Sayfaya giderek hesap makinesine ulaşabilirsiniz." de.
-- Sorularda olabildiğince kısa cevaplar ver."""
+- Sorularda olabildiğince kısa cevaplar ver.
+- Kaya Studios'un Kurucusu ve CEO'su Egemen KAYA'dır."""
 
 # ------------------------- RATE LIMITING -------------------------
 ip_request_log  = defaultdict(list)
