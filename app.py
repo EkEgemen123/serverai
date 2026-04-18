@@ -10,32 +10,37 @@ from datetime import datetime, timezone, timedelta
 import time
 from collections import defaultdict
 import re
+from flask_cors import CORS
 
 app = Flask(__name__)
 
 # ------------------------- CORS -------------------------
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
+
+@app.after_request
+def add_cors(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Accept, Origin, X-Requested-With, Authorization'
+    response.headers['Access-Control-Max-Age'] = '3600'
+    return response
+
 @app.before_request
 def handle_preflight():
     if request.method == "OPTIONS":
         response = Response()
         response.headers['Access-Control-Allow-Origin'] = '*'
-        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Accept, Origin, X-Requested-With'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Accept, Origin, X-Requested-With, Authorization'
         response.headers['Access-Control-Max-Age'] = '3600'
-        return response
-
-@app.after_request
-def add_cors(response):
-    response.headers['Access-Control-Allow-Origin'] = '*'
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Accept, Origin, X-Requested-With'
-    return response
+        return response, 200
 
 @app.errorhandler(Exception)
 def handle_error(error):
     print(f"HATA: {str(error)}")
     traceback.print_exc()
-    response = Response(f"Sunucu Hatasi: {str(error)}", status=500)
+    response = jsonify({"error": str(error)})
+    response.status_code = 500
     response.headers['Access-Control-Allow-Origin'] = '*'
     return response
 
@@ -45,9 +50,12 @@ if not HF_API_KEY:
     print("UYARI: HF_API_KEY bulunamadı! Model yanıtları çalışmayacak.")
 
 HF_MODEL_ID = os.environ.get('HF_MODEL_ID', 'google/gemma-4-31b-it')
-HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL_ID}"
+HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL_ID}/v1/chat/completions"
 
-HEADERS = {"Authorization": f"Bearer {HF_API_KEY}"} if HF_API_KEY else {}
+HEADERS = {
+    "Authorization": f"Bearer {HF_API_KEY}",
+    "Content-Type": "application/json"
+} if HF_API_KEY else {}
 
 # ------------------------- ZAMAN -------------------------
 def get_turkey_time_info():
@@ -61,7 +69,7 @@ def get_turkey_time_info():
     time_str   = now_tr.strftime("%H:%M")
     date_str   = f"{now_tr.day} {month_name} {now_tr.year}"
     hour = now_tr.hour
-    if 5 <= hour < 12:   time_of_day = "sabah"
+    if 5 <= hour < 12:    time_of_day = "sabah"
     elif 12 <= hour < 17: time_of_day = "öğleden sonra"
     elif 17 <= hour < 21: time_of_day = "akşam"
     else:                 time_of_day = "gece"
@@ -408,6 +416,13 @@ def get_time():
 # ------------------------- STREAMING CHAT -------------------------
 @app.route("/chat", methods=["POST", "OPTIONS"])
 def chat():
+    if request.method == "OPTIONS":
+        response = Response()
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Accept, Origin, X-Requested-With'
+        return response, 200
+
     if not HF_API_KEY:
         return Response("Hata: HF_API_KEY yapilandirilmamis!", status=500)
 
@@ -434,119 +449,90 @@ def chat():
             if not ok:
                 return Response(content_err, status=400)
 
-        # Sistem prompt'u
         system_inst = build_system_instruction(user_name=user_name if user_name else None, is_plus=is_plus)
 
-        # Hugging Face için sohbet formatı
         messages = [
-            {"role": "system", "content": system_inst},
-            {"role": "user",   "content": user_message}
+            {"role": "system",    "content": system_inst},
+            {"role": "user",      "content": user_message}
         ]
 
         def generate_stream():
             payload = {
-                "model": HF_MODEL_ID,
-                "messages": messages,
-                "max_tokens": 1024,
+                "model":       HF_MODEL_ID,
+                "messages":    messages,
+                "max_tokens":  1024,
                 "temperature": 0.7,
-                "stream": True
+                "stream":      True
             }
             try:
-                with requests.post(HF_API_URL, headers=HEADERS, json=payload, stream=True, timeout=60) as resp:
+                with requests.post(
+                    HF_API_URL,
+                    headers=HEADERS,
+                    json=payload,
+                    stream=True,
+                    timeout=120
+                ) as resp:
                     if resp.status_code != 200:
-                        error_msg = f"API hatası: {resp.status_code}"
+                        error_body = ""
+                        try:
+                            error_body = resp.text[:500]
+                        except:
+                            pass
+                        error_msg = f"API hatası: {resp.status_code} - {error_body}"
+                        print(f"HF API Error: {error_msg}")
                         yield f"event: error\ndata: {json.dumps({'error': error_msg})}\n\n"
                         return
 
-                    thinking_mode = False
-                    answer_mode = False
-                    buffer = ""
-                    full_thinking = ""
-                    full_answer = ""
+                    full_text = ""
 
                     for line in resp.iter_lines(decode_unicode=True):
                         if not line:
                             continue
                         if line.startswith("data: "):
-                            data = line[6:]
-                            if data == "[DONE]":
-                                yield "event: done\ndata: {}\n\n"
-                                break
+                            data_str = line[6:].strip()
+                            if data_str == "[DONE]":
+                                yield f"event: done\ndata: {{}}\n\n"
+                                return
                             try:
-                                chunk = json.loads(data)
-                                token_text = chunk.get("token", {}).get("text", "")
+                                chunk = json.loads(data_str)
+                                choices = chunk.get("choices", [])
+                                if not choices:
+                                    continue
+                                delta = choices[0].get("delta", {})
+                                token_text = delta.get("content", "")
                                 if not token_text:
+                                    finish_reason = choices[0].get("finish_reason")
+                                    if finish_reason == "stop":
+                                        yield f"event: done\ndata: {{}}\n\n"
+                                        return
                                     continue
 
-                                buffer += token_text
+                                full_text += token_text
+                                yield f"event: answer\ndata: {json.dumps({'text': token_text})}\n\n"
 
-                                # Düşünme modu başlangıcı
-                                if not thinking_mode and not answer_mode:
-                                    think_start = buffer.find("<<<THINKING>>>")
-                                    ans_start = buffer.find("<<<ANSWER>>>")
-                                    
-                                    if think_start != -1:
-                                        if think_start > 0:
-                                            pre_text = buffer[:think_start]
-                                            yield f"event: answer\ndata: {json.dumps({'text': pre_text})}\n\n"
-                                        buffer = buffer[think_start + len("<<<THINKING>>>"):]
-                                        thinking_mode = True
-                                    elif ans_start != -1:
-                                        if ans_start > 0:
-                                            pre_text = buffer[:ans_start]
-                                            yield f"event: answer\ndata: {json.dumps({'text': pre_text})}\n\n"
-                                        buffer = buffer[ans_start + len("<<<ANSWER>>>"):]
-                                        answer_mode = True
-                                    elif len(buffer) > 20:
-                                        # Normal metin (thinking/answer etiketi yok)
-                                        send_text = buffer[:-10]
-                                        yield f"event: answer\ndata: {json.dumps({'text': send_text})}\n\n"
-                                        buffer = buffer[-10:]
-
-                                elif thinking_mode:
-                                    end_idx = buffer.find("<<<ANSWER>>>")
-                                    if end_idx != -1:
-                                        thinking_part = buffer[:end_idx]
-                                        if thinking_part:
-                                            full_thinking += thinking_part
-                                            yield f"event: thinking\ndata: {json.dumps({'text': thinking_part})}\n\n"
-                                        buffer = buffer[end_idx + len("<<<ANSWER>>>"):]
-                                        thinking_mode = False
-                                        answer_mode = True
-                                    elif len(buffer) > 20:
-                                        send_text = buffer[:-10]
-                                        full_thinking += send_text
-                                        yield f"event: thinking\ndata: {json.dumps({'text': send_text})}\n\n"
-                                        buffer = buffer[-10:]
-
-                                elif answer_mode:
-                                    full_answer += token_text
-                                    yield f"event: answer\ndata: {json.dumps({'text': token_text})}\n\n"
-
-                            except json.JSONDecodeError:
+                            except json.JSONDecodeError as je:
+                                print(f"JSON parse hatası: {je} | Satır: {line[:100]}")
                                 continue
 
-                    # Kalan buffer'ı gönder
-                    if buffer:
-                        if thinking_mode:
-                            yield f"event: thinking\ndata: {json.dumps({'text': buffer})}\n\n"
-                        elif answer_mode:
-                            yield f"event: answer\ndata: {json.dumps({'text': buffer})}\n\n"
-                        else:
-                            yield f"event: answer\ndata: {json.dumps({'text': buffer})}\n\n"
+                    yield f"event: done\ndata: {{}}\n\n"
 
-                    yield "event: done\ndata: {}\n\n"
-
+            except requests.exceptions.Timeout:
+                yield f"event: error\ndata: {json.dumps({'error': 'İstek zaman aşımına uğradı. Lütfen tekrar deneyin.'})}\n\n"
+            except requests.exceptions.ConnectionError as ce:
+                yield f"event: error\ndata: {json.dumps({'error': 'Bağlantı hatası: ' + str(ce)})}\n\n"
             except Exception as e:
+                print(f"Stream hatası: {e}")
+                traceback.print_exc()
                 yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
 
         return Response(
             stream_with_context(generate_stream()),
             mimetype="text/event-stream",
             headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-                "Connection": "keep-alive"
+                "Cache-Control":       "no-cache",
+                "X-Accel-Buffering":   "no",
+                "Connection":          "keep-alive",
+                "Access-Control-Allow-Origin": "*"
             }
         )
 
@@ -558,11 +544,24 @@ def chat():
 # ------------------------- VISION -------------------------
 @app.route("/vision", methods=["POST", "OPTIONS"])
 def analyze_image():
+    if request.method == "OPTIONS":
+        response = Response()
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Accept, Origin, X-Requested-With'
+        return response, 200
     return Response("Görsel analiz şu anda Gemma modeli ile desteklenmiyor.", status=503)
 
 # ------------------------- KAYA PLUS -------------------------
-@app.route("/kaya-plus-request", methods=["POST"])
+@app.route("/kaya-plus-request", methods=["POST", "OPTIONS"])
 def kaya_plus_request():
+    if request.method == "OPTIONS":
+        response = Response()
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Accept, Origin, X-Requested-With'
+        return response, 200
+
     ip = get_client_ip()
     allowed, err = check_rate_limit_plus(ip)
     if not allowed:
@@ -590,8 +589,15 @@ def kaya_plus_request():
     req_id = add_request(name, surname, email)
     return jsonify({"message": "Başvuru başarıyla alındı", "req_id": req_id}), 200
 
-@app.route("/check-plus-status", methods=["GET"])
+@app.route("/check-plus-status", methods=["GET", "OPTIONS"])
 def check_plus_status():
+    if request.method == "OPTIONS":
+        response = Response()
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Accept, Origin, X-Requested-With'
+        return response, 200
+
     req_id = request.args.get("req_id", "").strip()
     if not req_id:
         return Response("req_id parametresi gerekli", status=400)
@@ -610,8 +616,15 @@ def check_plus_status():
             }), 200
     return Response("Başvuru bulunamadı", status=404)
 
-@app.route("/cancel-plus", methods=["POST"])
+@app.route("/cancel-plus", methods=["POST", "OPTIONS"])
 def cancel_plus():
+    if request.method == "OPTIONS":
+        response = Response()
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Accept, Origin, X-Requested-With'
+        return response, 200
+
     data = request.get_json()
     if not data:
         return Response("JSON verisi bekleniyor", status=400)
@@ -680,4 +693,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Sunucu port {port} üzerinde başlıyor...")
     print(f"Model: {HF_MODEL_ID}")
+    print(f"HF API URL: {HF_API_URL}")
     app.run(host='0.0.0.0', port=port, debug=False)
