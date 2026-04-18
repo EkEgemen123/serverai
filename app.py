@@ -39,7 +39,7 @@ def handle_error(error):
     response.headers['Access-Control-Allow-Origin'] = '*'
     return response
 
-# ------------------------- Model Yapılandırması (Hugging Face) -------------------------
+# ------------------------- Model Yapılandırması -------------------------
 HF_API_KEY = os.environ.get('HF_API_KEY')
 if not HF_API_KEY:
     print("UYARI: HF_API_KEY bulunamadı! Model yanıtları çalışmayacak.")
@@ -167,7 +167,7 @@ def check_content(message):
             return False, "Mesajınız güvenlik filtresine takıldı. Lütfen normal bir soru sorun."
     return True, ""
 
-# ------------------------- VERİTABANI (JSON) -------------------------
+# ------------------------- VERİTABANI -------------------------
 REQUESTS_FILE = "kaya_plus_requests.json"
 
 def load_requests():
@@ -238,7 +238,7 @@ def cancel_by_admin(req_id):
             return True, "ok"
     return False, "bulunamadi"
 
-# ------------------------- Admin HTML (Aynı) -------------------------
+# ------------------------- Admin HTML -------------------------
 ADMIN_HTML = """
 <!DOCTYPE html>
 <html lang="tr">
@@ -401,7 +401,11 @@ def health():
     time_info = get_turkey_time_info()
     return jsonify({"status": "OK", "turkey_time": time_info["full"], "version": "4.0", "model": HF_MODEL_ID})
 
-# ------------------------- STREAMING CHAT (YENİ) -------------------------
+@app.route("/time", methods=["GET"])
+def get_time():
+    return jsonify(get_turkey_time_info())
+
+# ------------------------- STREAMING CHAT -------------------------
 @app.route("/chat", methods=["POST", "OPTIONS"])
 def chat():
     if not HF_API_KEY:
@@ -414,12 +418,11 @@ def chat():
 
     try:
         user_message = request.form.get('message', '').strip()
-        image_file   = request.files.get('image')
         user_name    = request.form.get('user_name', '').strip()
         is_plus      = request.form.get('is_plus', 'false').lower() == 'true'
 
-        if not user_message and not image_file:
-            return Response("Mesaj veya görsel gerekli!", status=400)
+        if not user_message:
+            return Response("Mesaj gerekli!", status=400)
         if len(user_message) > MAX_MSG_LENGTH:
             return Response(f"Mesaj çok uzun. Maksimum {MAX_MSG_LENGTH} karakter gönderin.", status=400)
 
@@ -431,22 +434,16 @@ def chat():
             if not ok:
                 return Response(content_err, status=400)
 
-        # Görsel varsa base64'e çevir (Hugging Face text+image destekliyorsa)
-        # Şimdilik sadece metin destekleniyor, görsel varsa hata döndürüyoruz.
-        if image_file:
-            return Response("Görsel işleme şu anda desteklenmiyor. Lütfen sadece metin gönderin.", status=400)
-
         # Sistem prompt'u
         system_inst = build_system_instruction(user_name=user_name if user_name else None, is_plus=is_plus)
 
-        # Hugging Face için sohbet formatı (messages listesi)
+        # Hugging Face için sohbet formatı
         messages = [
             {"role": "system", "content": system_inst},
             {"role": "user",   "content": user_message}
         ]
 
         def generate_stream():
-            """Hugging Face API'ye streaming isteği yapıp SSE olarak döner."""
             payload = {
                 "model": HF_MODEL_ID,
                 "messages": messages,
@@ -457,13 +454,15 @@ def chat():
             try:
                 with requests.post(HF_API_URL, headers=HEADERS, json=payload, stream=True, timeout=60) as resp:
                     if resp.status_code != 200:
-                        error_msg = f"API hatası: {resp.status_code} - {resp.text}"
+                        error_msg = f"API hatası: {resp.status_code}"
                         yield f"event: error\ndata: {json.dumps({'error': error_msg})}\n\n"
                         return
 
-                    thinking_mode = False   # <<<THINKING>>> başladı mı?
-                    answer_mode = False     # <<<ANSWER>>> başladı mı?
+                    thinking_mode = False
+                    answer_mode = False
                     buffer = ""
+                    full_thinking = ""
+                    full_answer = ""
 
                     for line in resp.iter_lines(decode_unicode=True):
                         if not line:
@@ -475,62 +474,55 @@ def chat():
                                 break
                             try:
                                 chunk = json.loads(data)
-                                # Hugging Face SSE formatı: {"token": {"text": "..."}}
                                 token_text = chunk.get("token", {}).get("text", "")
                                 if not token_text:
                                     continue
 
                                 buffer += token_text
 
-                                # Düşünme / cevap etiketlerini ara
-                                while True:
-                                    if not thinking_mode and not answer_mode:
-                                        # Etiket arama
-                                        think_start = buffer.find("<<<THINKING>>>")
-                                        ans_start = buffer.find("<<<ANSWER>>>")
-                                        if think_start != -1:
-                                            # Önce normal metin varsa gönder (cevap olarak)
-                                            if think_start > 0:
-                                                pre_text = buffer[:think_start]
-                                                yield f"event: answer\ndata: {json.dumps({'text': pre_text})}\n\n"
-                                            buffer = buffer[think_start + len("<<<THINKING>>>"):]
-                                            thinking_mode = True
-                                            answer_mode = False
-                                        elif ans_start != -1:
-                                            if ans_start > 0:
-                                                pre_text = buffer[:ans_start]
-                                                yield f"event: answer\ndata: {json.dumps({'text': pre_text})}\n\n"
-                                            buffer = buffer[ans_start + len("<<<ANSWER>>>"):]
-                                            thinking_mode = False
-                                            answer_mode = True
-                                        else:
-                                            # Etiket yok, son parçayı answer olarak gönder
-                                            if len(buffer) > 20:  # 20 karakterden uzunsa
-                                                send_text = buffer[:-10]  # son 10 karakteri sakla (etiket başlangıcı olabilir)
-                                                yield f"event: answer\ndata: {json.dumps({'text': send_text})}\n\n"
-                                                buffer = buffer[-10:]
-                                            break
-                                    elif thinking_mode:
-                                        end_idx = buffer.find("<<<ANSWER>>>")
-                                        if end_idx != -1:
-                                            thinking_part = buffer[:end_idx]
-                                            if thinking_part:
-                                                yield f"event: thinking\ndata: {json.dumps({'text': thinking_part})}\n\n"
-                                            buffer = buffer[end_idx + len("<<<ANSWER>>>"):]
-                                            thinking_mode = False
-                                            answer_mode = True
-                                        else:
-                                            # Henüz cevap etiketi gelmedi, düşünme devam ediyor
-                                            # Belli aralıklarla gönder (gerçek zamanlı gözükmesi için)
-                                            if len(buffer) > 20:
-                                                send_text = buffer[:-10]
-                                                yield f"event: thinking\ndata: {json.dumps({'text': send_text})}\n\n"
-                                                buffer = buffer[-10:]
-                                            break
-                                    elif answer_mode:
-                                        # Cevap modunda her geleni doğrudan answer olarak gönder
-                                        yield f"event: answer\ndata: {json.dumps({'text': token_text})}\n\n"
-                                        # (Not: buffer temizliği yukarıda yapıldı)
+                                # Düşünme modu başlangıcı
+                                if not thinking_mode and not answer_mode:
+                                    think_start = buffer.find("<<<THINKING>>>")
+                                    ans_start = buffer.find("<<<ANSWER>>>")
+                                    
+                                    if think_start != -1:
+                                        if think_start > 0:
+                                            pre_text = buffer[:think_start]
+                                            yield f"event: answer\ndata: {json.dumps({'text': pre_text})}\n\n"
+                                        buffer = buffer[think_start + len("<<<THINKING>>>"):]
+                                        thinking_mode = True
+                                    elif ans_start != -1:
+                                        if ans_start > 0:
+                                            pre_text = buffer[:ans_start]
+                                            yield f"event: answer\ndata: {json.dumps({'text': pre_text})}\n\n"
+                                        buffer = buffer[ans_start + len("<<<ANSWER>>>"):]
+                                        answer_mode = True
+                                    elif len(buffer) > 20:
+                                        # Normal metin (thinking/answer etiketi yok)
+                                        send_text = buffer[:-10]
+                                        yield f"event: answer\ndata: {json.dumps({'text': send_text})}\n\n"
+                                        buffer = buffer[-10:]
+
+                                elif thinking_mode:
+                                    end_idx = buffer.find("<<<ANSWER>>>")
+                                    if end_idx != -1:
+                                        thinking_part = buffer[:end_idx]
+                                        if thinking_part:
+                                            full_thinking += thinking_part
+                                            yield f"event: thinking\ndata: {json.dumps({'text': thinking_part})}\n\n"
+                                        buffer = buffer[end_idx + len("<<<ANSWER>>>"):]
+                                        thinking_mode = False
+                                        answer_mode = True
+                                    elif len(buffer) > 20:
+                                        send_text = buffer[:-10]
+                                        full_thinking += send_text
+                                        yield f"event: thinking\ndata: {json.dumps({'text': send_text})}\n\n"
+                                        buffer = buffer[-10:]
+
+                                elif answer_mode:
+                                    full_answer += token_text
+                                    yield f"event: answer\ndata: {json.dumps({'text': token_text})}\n\n"
+
                             except json.JSONDecodeError:
                                 continue
 
@@ -563,12 +555,12 @@ def chat():
         traceback.print_exc()
         return Response(f"AI Hatası: {str(e)}", status=500)
 
-# ------------------------- GÖRÜNTÜ ANALİZİ (Şimdilik devre dışı) -------------------------
+# ------------------------- VISION -------------------------
 @app.route("/vision", methods=["POST", "OPTIONS"])
 def analyze_image():
     return Response("Görsel analiz şu anda Gemma modeli ile desteklenmiyor.", status=503)
 
-# ------------------------- KAYA PLUS İŞLEMLERİ (AYNI) -------------------------
+# ------------------------- KAYA PLUS -------------------------
 @app.route("/kaya-plus-request", methods=["POST"])
 def kaya_plus_request():
     ip = get_client_ip()
@@ -637,26 +629,7 @@ def cancel_plus():
         return Response("Yalnızca aktif (onaylı) üyelikler iptal edilebilir.", status=400)
     return Response("Kayıt bulunamadı", status=404)
 
-@app.route("/admin/cancel/<req_id>", methods=["POST"])
-def admin_cancel_subscription(req_id):
-    token = request.args.get("token")
-    if token != "KAYAADMIN":
-        return Response("Yetkisiz erişim", status=401)
-    try:
-        uuid.UUID(req_id)
-    except ValueError:
-        return Response("Geçersiz req_id", status=400)
-    success, reason = cancel_by_admin(req_id)
-    if success:
-        return Response("Üyelik iptal edildi", status=200)
-    if reason == "gecersiz_durum":
-        return Response("Bu kayıt zaten iptal edilmiş veya beklemede.", status=400)
-    return Response("Kayıt bulunamadı", status=404)
-
-@app.route("/time", methods=["GET"])
-def get_time():
-    return jsonify(get_turkey_time_info())
-
+# ------------------------- ADMIN -------------------------
 @app.route("/admin", methods=["GET"])
 def admin_panel():
     token = request.args.get("token")
@@ -686,6 +659,22 @@ def admin_update_request(req_id):
     if update_request_status(req_id, status):
         return Response("Güncellendi", status=200)
     return Response("Başvuru bulunamadı", status=404)
+
+@app.route("/admin/cancel/<req_id>", methods=["POST"])
+def admin_cancel_subscription(req_id):
+    token = request.args.get("token")
+    if token != "KAYAADMIN":
+        return Response("Yetkisiz erişim", status=401)
+    try:
+        uuid.UUID(req_id)
+    except ValueError:
+        return Response("Geçersiz req_id", status=400)
+    success, reason = cancel_by_admin(req_id)
+    if success:
+        return Response("Üyelik iptal edildi", status=200)
+    if reason == "gecersiz_durum":
+        return Response("Bu kayıt zaten iptal edilmiş veya beklemede.", status=400)
+    return Response("Kayıt bulunamadı", status=404)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
