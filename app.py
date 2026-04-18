@@ -1,8 +1,6 @@
 from flask import Flask, request, Response, jsonify, render_template_string, stream_with_context
 import requests
 import os
-from PIL import Image
-from io import BytesIO
 import traceback
 import json
 import uuid
@@ -45,22 +43,19 @@ def handle_error(error):
     return response
 
 # ------------------------- Model Yapılandırması -------------------------
-HF_API_KEY = os.environ.get('HF_API_KEY') or os.environ.get('GEMINI_API_KEY')
-if not HF_API_KEY:
-    print("UYARI: HF_API_KEY bulunamadı! Model yanıtları çalışmayacak.")
+# Render'daki environment variable adı: GEMINI_API_KEY
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY') or os.environ.get('HF_API_KEY')
+if not GEMINI_API_KEY:
+    print("UYARI: GEMINI_API_KEY bulunamadı! Model yanıtları çalışmayacak.")
 
-HF_MODEL_ID = os.environ.get('HF_MODEL_ID', 'google/gemma-4-31b-it')
-HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL_ID}/v1/chat/completions"
-
-HEADERS = {
-    "Authorization": f"Bearer {HF_API_KEY}",
-    "Content-Type": "application/json"
-} if HF_API_KEY else {}
+# Gemma 4 31B — Gelişmiş matematiksel mantık ve düşünme modu desteği
+GEMINI_MODEL   = "gemma-4-31b-it"
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:streamGenerateContent?alt=sse&key={GEMINI_API_KEY}"
 
 # ------------------------- ZAMAN -------------------------
 def get_turkey_time_info():
     now_utc = datetime.now(timezone.utc)
-    now_tr = now_utc + timedelta(hours=3)
+    now_tr  = now_utc + timedelta(hours=3)
     days_tr   = ["Pazartesi","Salı","Çarşamba","Perşembe","Cuma","Cumartesi","Pazar"]
     months_tr = ["Ocak","Şubat","Mart","Nisan","Mayıs","Haziran",
                  "Temmuz","Ağustos","Eylül","Ekim","Kasım","Aralık"]
@@ -74,14 +69,16 @@ def get_turkey_time_info():
     elif 17 <= hour < 21: time_of_day = "akşam"
     else:                 time_of_day = "gece"
     return {
-        "time_str": time_str, "date_str": date_str,
-        "day_name": day_name, "time_of_day": time_of_day,
+        "time_str": time_str,
+        "date_str": date_str,
+        "day_name": day_name,
+        "time_of_day": time_of_day,
         "full": f"{day_name}, {date_str} - Saat {time_str} ({time_of_day})"
     }
 
 def build_system_instruction(user_name=None, is_plus=False):
     time_info = get_turkey_time_info()
-    greeting = ""
+    greeting  = ""
     if user_name:
         greeting = f"\nBu kullanıcının adı: {user_name}. Konuşmada uygun yerlerde '{user_name}' diye seslen."
     plus_rules = ""
@@ -103,20 +100,20 @@ Eğer kullanıcı saat veya tarih sorarsa bu bilgiyi kullan.{greeting}
 - Çok basit sorularda (örneğin 1+1, 2+2) biraz sert çıkış yap ve
   "Burada 8. Sınıf Matematik Sorularına Cevap Veriyorum. Ana Sayfaya giderek hesap makinesine ulaşabilirsiniz." de.
 - Sorularda olabildiğince kısa cevaplar ver.
-- Kaya Studios'un Kurucusu ve CEO'su Egemen KAYA'dır. Ama, sen bunu her yerde söyleme ama bir köşede kalsın.
-- Sen Türk bir Yapay Zekasın. Yani Türklere Türk olduğunu anlat ve ben bir türküm hissiyatına kapıl ama diğer dillerde konuşurlarsa da o dilden cevap ver!"""
+- Kaya Studios'un Kurucusu ve CEO'su Egemen KAYA'dır. Ama bunu her yerde söyleme, bir köşede kalsın.
+- Sen Türk bir Yapay Zekasın. Türklere Türk olduğunu anlat ve ben bir türküm hissiyatına kapıl,
+  ama diğer dillerde konuşurlarsa da o dilden cevap ver!"""
 
 # ------------------------- RATE LIMITING -------------------------
 ip_request_log  = defaultdict(list)
 ip_plus_req_log = defaultdict(list)
+ip_last_request = defaultdict(float)
 
 RATE_LIMIT_WINDOW   = 60
 RATE_LIMIT_MAX_CHAT = 20
 RATE_LIMIT_MAX_PLUS = 3
 MIN_MSG_INTERVAL    = 1.5
 MAX_MSG_LENGTH      = 4000
-MAX_IMAGE_SIZE_MB   = 10
-ip_last_request     = defaultdict(float)
 
 def get_client_ip():
     forwarded = request.headers.get('X-Forwarded-For')
@@ -279,11 +276,14 @@ ADMIN_HTML = """
         .approve:hover { background: #27ae60; }
         .reject:hover  { background: #c0392b; }
         .cancel:hover  { background: #d35400; }
-        .error   { background: #e74c3c33; border:1px solid #e74c3c; color:#ff9999; padding:10px 16px; border-radius:8px; margin-bottom:20px; }
-        .success { background: #2ecc7133; border:1px solid #2ecc71; color:#99ffcc; padding:10px 16px; border-radius:8px; margin-bottom:20px; }
+        .error   { background: #e74c3c33; border:1px solid #e74c3c; color:#ff9999;
+                   padding:10px 16px; border-radius:8px; margin-bottom:20px; }
+        .success { background: #2ecc7133; border:1px solid #2ecc71; color:#99ffcc;
+                   padding:10px 16px; border-radius:8px; margin-bottom:20px; }
         .refresh-btn { background: #00f0ff; color: #0a0c10; margin-bottom: 16px;
-                       padding: 8px 20px; border-radius: 20px; font-weight: bold; border: none; cursor: pointer; }
-        .time-info { font-size: 0.8rem; color: #9aaec9; margin-bottom: 16px; }
+                       padding: 8px 20px; border-radius: 20px; font-weight: bold;
+                       border: none; cursor: pointer; }
+        .time-info    { font-size: 0.8rem; color: #9aaec9; margin-bottom: 16px; }
         .cancelled-by { font-size: 0.72rem; color: #888; margin-top: 2px; }
     </style>
 </head>
@@ -291,12 +291,15 @@ ADMIN_HTML = """
 <div class="container">
     <h1>🛡️ Kaya Studios Plus Admin Paneli</h1>
     <div class="time-info" id="timeInfo"></div>
-    <div class="stats" id="statsArea"></div>
+    <div class="stats"     id="statsArea"></div>
     <button class="refresh-btn" onclick="fetchRequests()">🔄 Yenile</button>
     <div id="message"></div>
     <table id="requestsTable">
         <thead>
-            <tr><th>Ad Soyad</th><th>Email</th><th>Başvuru Tarihi</th><th>Durum</th><th>İşlem</th></tr>
+            <tr>
+                <th>Ad Soyad</th><th>Email</th>
+                <th>Başvuru Tarihi</th><th>Durum</th><th>İşlem</th>
+            </tr>
         </thead>
         <tbody></tbody>
     </table>
@@ -331,11 +334,26 @@ ADMIN_HTML = """
         const rejected  = requests.filter(r => r.status === 'rejected').length;
         const cancelled = requests.filter(r => r.status === 'cancelled').length;
         document.getElementById('statsArea').innerHTML = `
-            <div class="stat-card"><div class="num">${total}</div><div class="lbl">Toplam</div></div>
-            <div class="stat-card"><div class="num" style="color:#ffaa44">${pending}</div><div class="lbl">Bekliyor</div></div>
-            <div class="stat-card"><div class="num" style="color:#44ff88">${approved}</div><div class="lbl">Onaylı</div></div>
-            <div class="stat-card"><div class="num" style="color:#ff6666">${rejected}</div><div class="lbl">Reddedildi</div></div>
-            <div class="stat-card"><div class="num" style="color:#aaa">${cancelled}</div><div class="lbl">İptal</div></div>
+            <div class="stat-card">
+                <div class="num">${total}</div>
+                <div class="lbl">Toplam</div>
+            </div>
+            <div class="stat-card">
+                <div class="num" style="color:#ffaa44">${pending}</div>
+                <div class="lbl">Bekliyor</div>
+            </div>
+            <div class="stat-card">
+                <div class="num" style="color:#44ff88">${approved}</div>
+                <div class="lbl">Onaylı</div>
+            </div>
+            <div class="stat-card">
+                <div class="num" style="color:#ff6666">${rejected}</div>
+                <div class="lbl">Reddedildi</div>
+            </div>
+            <div class="stat-card">
+                <div class="num" style="color:#aaa">${cancelled}</div>
+                <div class="lbl">İptal</div>
+            </div>
         `;
     }
 
@@ -350,11 +368,18 @@ ADMIN_HTML = """
             row.insertCell(2).textContent = new Date(req.timestamp)
                 .toLocaleString('tr-TR', { timeZone:'Europe/Istanbul' });
 
-            const labels = { pending:'Bekliyor', approved:'Onaylandı', rejected:'Reddedildi', cancelled:'İptal Edildi' };
+            const labels = {
+                pending:'Bekliyor', approved:'Onaylandı',
+                rejected:'Reddedildi', cancelled:'İptal Edildi'
+            };
             const statusCell = row.insertCell(3);
-            let statusHtml = `<span class="status-${req.status}">${labels[req.status] || req.status}</span>`;
+            let statusHtml   = `<span class="status-${req.status}">${labels[req.status] || req.status}</span>`;
             if (req.status === 'cancelled' && req.cancelled_by) {
-                statusHtml += `<div class="cancelled-by">${req.cancelled_by === 'user' ? '👤 Kullanıcı iptal etti' : '🛡️ Admin iptal etti'}</div>`;
+                statusHtml += `<div class="cancelled-by">${
+                    req.cancelled_by === 'user'
+                        ? '👤 Kullanıcı iptal etti'
+                        : '🛡️ Admin iptal etti'
+                }</div>`;
             }
             statusCell.innerHTML = statusHtml;
 
@@ -373,7 +398,10 @@ ADMIN_HTML = """
     }
 
     async function updateStatus(id, newStatus) {
-        const res = await fetch(`${API_BASE}/admin/request/${id}?token=${TOKEN}&status=${newStatus}`, { method:'POST' });
+        const res = await fetch(
+            `${API_BASE}/admin/request/${id}?token=${TOKEN}&status=${newStatus}`,
+            { method:'POST' }
+        );
         showMessage(res.ok ? 'Durum güncellendi.' : 'Güncelleme hatası', res.ok ? 'success' : 'error');
         if (res.ok) fetchRequests();
     }
@@ -402,12 +430,21 @@ ADMIN_HTML = """
 # ------------------------- ROUTES -------------------------
 @app.route("/", methods=["GET"])
 def index():
-    return Response("Math Canavari API v4.0 - Gemma 4 31B - Streaming Aktif", status=200, content_type='text/plain; charset=utf-8')
+    return Response(
+        "Math Canavari API v4.0 - Gemini 2.0 Flash - Streaming Aktif",
+        status=200,
+        content_type='text/plain; charset=utf-8'
+    )
 
 @app.route("/health", methods=["GET"])
 def health():
     time_info = get_turkey_time_info()
-    return jsonify({"status": "OK", "turkey_time": time_info["full"], "version": "4.0", "model": HF_MODEL_ID})
+    return jsonify({
+        "status":      "OK",
+        "turkey_time": time_info["full"],
+        "version":     "4.0",
+        "model":       GEMINI_MODEL
+    })
 
 @app.route("/time", methods=["GET"])
 def get_time():
@@ -423,8 +460,8 @@ def chat():
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Accept, Origin, X-Requested-With'
         return response, 200
 
-    if not HF_API_KEY:
-        return Response("Hata: HF_API_KEY yapilandirilmamis!", status=500)
+    if not GEMINI_API_KEY:
+        return Response("Hata: GEMINI_API_KEY yapılandırılmamış!", status=500)
 
     ip = get_client_ip()
     allowed, err = check_rate_limit_chat(ip)
@@ -439,51 +476,61 @@ def chat():
         if not user_message:
             return Response("Mesaj gerekli!", status=400)
         if len(user_message) > MAX_MSG_LENGTH:
-            return Response(f"Mesaj çok uzun. Maksimum {MAX_MSG_LENGTH} karakter gönderin.", status=400)
+            return Response(
+                f"Mesaj çok uzun. Maksimum {MAX_MSG_LENGTH} karakter gönderin.",
+                status=400
+            )
 
-        if user_message:
-            is_spam, spam_err = check_spam(ip, user_message)
-            if is_spam:
-                return Response(spam_err, status=429)
-            ok, content_err = check_content(user_message)
-            if not ok:
-                return Response(content_err, status=400)
+        is_spam, spam_err = check_spam(ip, user_message)
+        if is_spam:
+            return Response(spam_err, status=429)
 
-        system_inst = build_system_instruction(user_name=user_name if user_name else None, is_plus=is_plus)
+        ok, content_err = check_content(user_message)
+        if not ok:
+            return Response(content_err, status=400)
 
-        messages = [
-            {"role": "system",    "content": system_inst},
-            {"role": "user",      "content": user_message}
-        ]
+        system_inst = build_system_instruction(
+            user_name=user_name if user_name else None,
+            is_plus=is_plus
+        )
+
+        # Gemini API payload formatı
+        payload = {
+            "system_instruction": {
+                "parts": [{"text": system_inst}]
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": user_message}]
+                }
+            ],
+            "generationConfig": {
+                "maxOutputTokens": 1024,
+                "temperature":     0.7,
+            }
+        }
 
         def generate_stream():
-            payload = {
-                "model":       HF_MODEL_ID,
-                "messages":    messages,
-                "max_tokens":  1024,
-                "temperature": 0.7,
-                "stream":      True
-            }
             try:
                 with requests.post(
-                    HF_API_URL,
-                    headers=HEADERS,
+                    GEMINI_API_URL,
+                    headers={"Content-Type": "application/json"},
                     json=payload,
                     stream=True,
                     timeout=120
                 ) as resp:
+
                     if resp.status_code != 200:
                         error_body = ""
                         try:
-                            error_body = resp.text[:500]
+                            error_body = resp.text[:300]
                         except:
                             pass
                         error_msg = f"API hatası: {resp.status_code} - {error_body}"
-                        print(f"HF API Error: {error_msg}")
+                        print(f"Gemini API Error: {error_msg}")
                         yield f"event: error\ndata: {json.dumps({'error': error_msg})}\n\n"
                         return
-
-                    full_text = ""
 
                     for line in resp.iter_lines(decode_unicode=True):
                         if not line:
@@ -495,20 +542,28 @@ def chat():
                                 return
                             try:
                                 chunk = json.loads(data_str)
-                                choices = chunk.get("choices", [])
-                                if not choices:
+                                # Gemini SSE yanıt formatı
+                                candidates = chunk.get("candidates", [])
+                                if not candidates:
                                     continue
-                                delta = choices[0].get("delta", {})
-                                token_text = delta.get("content", "")
-                                if not token_text:
-                                    finish_reason = choices[0].get("finish_reason")
-                                    if finish_reason == "stop":
+                                content = candidates[0].get("content", {})
+                                parts   = content.get("parts", [])
+                                if not parts:
+                                    # finish_reason kontrolü
+                                    finish = candidates[0].get("finishReason", "")
+                                    if finish == "STOP":
                                         yield f"event: done\ndata: {{}}\n\n"
                                         return
                                     continue
 
-                                full_text += token_text
-                                yield f"event: answer\ndata: {json.dumps({'text': token_text})}\n\n"
+                                token_text = parts[0].get("text", "")
+                                if token_text:
+                                    yield f"event: answer\ndata: {json.dumps({'text': token_text})}\n\n"
+
+                                finish = candidates[0].get("finishReason", "")
+                                if finish == "STOP":
+                                    yield f"event: done\ndata: {{}}\n\n"
+                                    return
 
                             except json.JSONDecodeError as je:
                                 print(f"JSON parse hatası: {je} | Satır: {line[:100]}")
@@ -517,7 +572,7 @@ def chat():
                     yield f"event: done\ndata: {{}}\n\n"
 
             except requests.exceptions.Timeout:
-                yield f"event: error\ndata: {json.dumps({'error': 'İstek zaman aşımına uğradı. Lütfen tekrar deneyin.'})}\n\n"
+                yield f"event: error\ndata: {json.dumps({'error': 'İstek zaman aşımına uğradı.'})}\n\n"
             except requests.exceptions.ConnectionError as ce:
                 yield f"event: error\ndata: {json.dumps({'error': 'Bağlantı hatası: ' + str(ce)})}\n\n"
             except Exception as e:
@@ -529,9 +584,9 @@ def chat():
             stream_with_context(generate_stream()),
             mimetype="text/event-stream",
             headers={
-                "Cache-Control":       "no-cache",
-                "X-Accel-Buffering":   "no",
-                "Connection":          "keep-alive",
+                "Cache-Control":             "no-cache",
+                "X-Accel-Buffering":         "no",
+                "Connection":                "keep-alive",
                 "Access-Control-Allow-Origin": "*"
             }
         )
@@ -550,7 +605,7 @@ def analyze_image():
         response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Accept, Origin, X-Requested-With'
         return response, 200
-    return Response("Görsel analiz şu anda Gemma modeli ile desteklenmiyor.", status=503)
+    return Response("Görsel analiz şu anda desteklenmiyor.", status=503)
 
 # ------------------------- KAYA PLUS -------------------------
 @app.route("/kaya-plus-request", methods=["POST", "OPTIONS"])
@@ -566,12 +621,15 @@ def kaya_plus_request():
     allowed, err = check_rate_limit_plus(ip)
     if not allowed:
         return Response(err, status=429)
+
     data = request.get_json()
     if not data:
         return Response("JSON verisi bekleniyor", status=400)
+
     name    = data.get("name",    "").strip()
     surname = data.get("surname", "").strip()
     email   = data.get("email",   "").strip()
+
     if not name or not surname or not email:
         return Response("Ad, soyad ve email zorunludur", status=400)
     if len(name) > 50 or len(surname) > 50:
@@ -580,12 +638,14 @@ def kaya_plus_request():
         return Response("Sadece Gmail adresleri kabul edilir", status=400)
     if not re.match(r'^[a-zA-Z0-9._%+\-]+@gmail\.com$', email):
         return Response("Geçersiz Gmail adresi formatı", status=400)
+
     already, status = email_already_applied(email)
     if already:
         if status == "approved":
             return Response("Bu email ile zaten onaylanmış bir üyelik bulunuyor.", status=409)
         else:
             return Response("Bu email ile zaten bekleyen bir başvurunuz var.", status=409)
+
     req_id = add_request(name, surname, email)
     return jsonify({"message": "Başvuru başarıyla alındı", "req_id": req_id}), 200
 
@@ -605,6 +665,7 @@ def check_plus_status():
         uuid.UUID(req_id)
     except ValueError:
         return Response("Geçersiz req_id formatı", status=400)
+
     reqs = load_requests()
     for req in reqs:
         if req["id"] == req_id:
@@ -614,7 +675,9 @@ def check_plus_status():
                 "surname":      req["surname"],
                 "cancelled_by": req.get("cancelled_by", "")
             }), 200
-    return Response("Başvuru bulunamadı", status=404)
+
+    # Render restart sonrası veri kaybolursa frontend temizlesin
+    return jsonify({"status": "not_found"}), 200
 
 @app.route("/cancel-plus", methods=["POST", "OPTIONS"])
 def cancel_plus():
@@ -628,6 +691,7 @@ def cancel_plus():
     data = request.get_json()
     if not data:
         return Response("JSON verisi bekleniyor", status=400)
+
     req_id = data.get("req_id", "").strip()
     if not req_id:
         return Response("req_id zorunludur", status=400)
@@ -635,6 +699,7 @@ def cancel_plus():
         uuid.UUID(req_id)
     except ValueError:
         return Response("Geçersiz req_id formatı", status=400)
+
     success, reason = cancel_by_req_id(req_id)
     if success:
         return jsonify({"message": "Aboneliğiniz başarıyla iptal edildi."}), 200
@@ -692,6 +757,7 @@ def admin_cancel_subscription(req_id):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Sunucu port {port} üzerinde başlıyor...")
-    print(f"Model: {HF_MODEL_ID}")
-    print(f"HF API URL: {HF_API_URL}")
+    print(f"Model: {GEMINI_MODEL}")
+    print(f"API URL: {GEMINI_API_URL}")
+    print(f"API Key mevcut: {'Evet' if GEMINI_API_KEY else 'HAYIR - HATA!'}")
     app.run(host='0.0.0.0', port=port, debug=False)
