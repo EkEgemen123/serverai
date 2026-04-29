@@ -125,30 +125,43 @@ def needs_research(text: str):
     if len(lower) < 5:
         return False, ""
 
-    has_person_or_date = bool(re.search(
-        r"(kim|ne\s*zaman|tarih|nedir|hakkında|biyografi|doğdu|öldü|kurdu|keşfetti)",
-        lower
-    ))
+    # 1. Tamamen matematiksel bir ifade veya işlem komutu mu?
+    for pattern in PURE_MATH_PATTERNS:
+        if re.match(pattern, lower, re.IGNORECASE):
+            return False, ""
+    for kw in MATH_ONLY_KEYWORDS:
+        if kw in lower:
+            return False, ""
 
-    if not has_person_or_date:
-        for pattern in PURE_MATH_PATTERNS:
-            if re.match(pattern, lower, re.IGNORECASE):
-                return False, ""
-        for kw in MATH_ONLY_KEYWORDS:
-            if kw in lower:
-                return False, ""
+    # 2. Sohbet/Selamlaşma ise araştırma yapma
+    chat_patterns = [r"^(merhaba|selam|nasılsın|naber|iyi\s*günler|iyi\s*akşamlar|günaydın|hey|alo)$", r"^teşekkür", r"^sağol", r"^ok(ey)?$"]
+    for cp in chat_patterns:
+        if re.search(cp, lower):
+            return False, ""
 
+    query = text.strip()
+    query = re.sub(
+        r"\b(lütfen|acaba|bana\s*söyle|söyler\s*misin|öğrenebilir\s*miyim|merak\s*ediyorum|bana\s*anlat)\b",
+        "", query, flags=re.IGNORECASE
+    ).strip()
+    query = re.sub(r'[\r\n]+', ' ', query).strip()
+
+    # 3. Bilinen özel araştırma şablonlarından biri mi?
     for pattern, ptype in RESEARCH_PATTERNS:
         if re.search(pattern, lower, re.IGNORECASE):
-            query = text.strip()
-            query = re.sub(
-                r"\b(lütfen|acaba|bana\s*söyle|söyler\s*misin|öğrenebilir\s*miyim|merak\s*ediyorum|bana\s*anlat)\b",
-                "", query, flags=re.IGNORECASE
-            ).strip()
-            # Newline temizle
-            query = re.sub(r'[\r\n]+', ' ', query).strip()
             print(f"[RESEARCH DETECT] type='{ptype}' query='{query}'")
             return True, query
+
+    # 4. Genel soru kalıplarına uyuyorsa (kim, nerede, kaç, nedir vb.) araştır.
+    general_question_words = r"\b(kim|nedir|ne|nerede|nasıl|ne\s*zaman|kaç|hangisi|hakkında|kimdir|neden|niçin|fiyatı|son\s*durum|maçı)\b"
+    if re.search(general_question_words, lower):
+        print(f"[RESEARCH DETECT] type='general_question' query='{query}'")
+        return True, query
+
+    # İçinde soru işareti varsa araştır
+    if "?" in lower:
+        print(f"[RESEARCH DETECT] type='question_mark' query='{query}'")
+        return True, query
 
     return False, ""
 
@@ -201,10 +214,19 @@ def google_search(query: str, num_results: int = 5) -> list[dict]:
                 domain = urlparse(item.get("link", "")).netloc.replace("www.", "")
             except Exception:
                 domain = ""
+                
+            snippet = item.get("snippet", "")
+            pagemap = item.get("pagemap", {})
+            metatags = pagemap.get("metatags", [])
+            if metatags and isinstance(metatags, list) and len(metatags) > 0:
+                og_desc = metatags[0].get("og:description", "")
+                if og_desc and len(og_desc) > len(snippet):
+                    snippet = og_desc
+
             results.append({
-                "title":   item.get("title", "")[:120],
+                "title":   item.get("title", "")[:150],
                 "link":    item.get("link", ""),
-                "snippet": item.get("snippet", "")[:300],
+                "snippet": snippet[:600].replace('\n', ' '),
                 "domain":  domain,
             })
         return results
@@ -228,7 +250,7 @@ def format_search_results_for_ai(results: list[dict], query: str) -> str:
         f"## Google Araştırma Sonuçları ({len(results)} kaynak)",
         f"Arama: {query}",
         "",
-        "Aşağıdaki gerçek Google sonuçlarını kullan:",
+        "Aşağıdaki güncel Google arama sonuçları, senin bilgini güncellemek ve desteklemek içindir:",
         "",
     ]
     for i, r in enumerate(results, 1):
@@ -238,7 +260,10 @@ def format_search_results_for_ai(results: list[dict], query: str) -> str:
             lines.append(f"  Özet: {r['snippet']}")
         lines.append("")
     lines.append("---")
-    lines.append("Bu kaynakları kullanarak Türkçe yanıtla. Sonunda '📚 Kaynak: [site]' ekle.")
+    lines.append("LÜTFEN ŞUNLARA DİKKAT ET:")
+    lines.append("1. Bu özetlerdeki verileri GÜNCEL BİLGİ olarak kabul et ve cevabını buna göre oluştur.")
+    lines.append("2. Sadece özetlerdeki kısa cümlelerle yetinme; KENDİ ENGİN BİLGİ BİRİKİMİNİ DE KULLANARAK kullanıcıya kapsamlı, detaylı, profesyonel ve tatmin edici bir yanıt ver.")
+    lines.append("3. Cevabının sonuna '📚 Kaynaklar: [kullandığın kaynakların isimleri]' şeklinde bir ibare ekle.")
     return "\n".join(lines)
 
 
@@ -272,24 +297,21 @@ def build_system_instruction(user_name=None, is_plus=False, research_context="")
         research_block = f"""
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-GOOGLE ARAŞTIRMA SONUÇLARI — BUNLARI KULLAN:
+GÜNCEL GOOGLE ARAŞTIRMA SONUÇLARI
 {research_context}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Yukarıdaki Google sonuçlarına dayanarak cevap ver.
-Cevabının sonuna '📚 Kaynak: [kaynak adı]' ekle.
 """
 
-    return f"""Sen Math Canavarı'sın — Kaya Studios tarafından geliştirildin.
+    return f"""Sen Math Canavarı'sın — Kaya Studios tarafından geliştirilen, son derece akıllı, güncel bilgilere sahip ve detaylı cevaplar veren bir yapay zeka asistanısın.
 Şu anki Türkiye saati: {time_info['full']}{greeting}
 
 KURALLAR:
-- 8. sınıf öğrencilerine öncelikli olarak matematik sorularında yardımcı ol.{plus_rules}
+- Matematik ve eğitim konularında uzmansın. 8. sınıf öğrencilerine de uygun, anlaşılır açıklamalar yaparsın.{plus_rules}
 - Matematik sorularını adım adım çöz, LaTeX kullan ($...$ veya $$...$$).
 - Madde işareti olarak * yerine - kullan.
-- "Google kurdu" ifadesini ASLA kullanma.
+- "Google kurdu" veya "Büyük dil modeli" gibi ifadeleri ASLA kullanma.
 - Yalnızca Türkçe konuş (başka dilde sorulursa o dilde cevapla).
-- Samimi, motive edici ve kısa cevaplar ver.
-- 1+1 gibi çok basit sorularda: "Burada 8. Sınıf Matematik Sorularına Cevap Veriyorum." de.
+- Kullanıcının sorusunu EN YÜKSEK KALİTEDE, doyurucu ve detaylı bir şekilde yanıtla. Kısa, baştan savma ve robotik cevaplardan kaçın.
 - Kaya Studios kurucusu Egemen KAYA'dır.
 - Sen Türk bir yapay zekasın.
 {research_block}"""
