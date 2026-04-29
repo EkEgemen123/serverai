@@ -659,13 +659,20 @@ def chat():
                 return Response(content_err, status=400)
 
         # ─── GOOGLE ARAŞTIRMASI ───
+        # ─── GOOGLE ARAŞTIRMASI ───
         research_context = ""
         search_results   = []
         search_performed = False
         search_query     = ""
 
         if user_message and not image_file:
-            do_research, query = needs_research(user_message)
+            # ⭐ Önce ayrı search_query parametresine bak, yoksa user_message'dan çıkar
+            raw_search_query = request.form.get('search_query', '').strip()
+            if raw_search_query:
+                do_research, query = needs_research(raw_search_query)
+            else:
+                do_research, query = needs_research(user_message)
+            
             if do_research:
                 print(f"[CHAT] Araştırma: '{query[:60]}'")
                 search_results   = google_search(query, num_results=5)
@@ -676,7 +683,6 @@ def chat():
                     print(f"[CHAT] {len(search_results)} sonuç AI'a verildi")
                 else:
                     print("[CHAT] Sonuç yok — AI kendi bilgisinden yanıtlar")
-
         # ─── GÖRSEL İŞLEME ───
         parts = []
         if image_file:
