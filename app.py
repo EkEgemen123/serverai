@@ -42,7 +42,6 @@ def handle_error(error):
     return response
 
 # ========================= GEMİNİ ÇOKLU API =========================
-# Environment'tan 3 ayrı API key al
 GEMINI_KEYS = []
 for _env_name in ['GEMINI1', 'GEMINI2', 'GEMINI3']:
     _key = os.environ.get(_env_name, '').strip()
@@ -52,7 +51,6 @@ for _env_name in ['GEMINI1', 'GEMINI2', 'GEMINI3']:
     else:
         print(f"⚠️  {_env_name} bulunamadı, atlanıyor.")
 
-# Geriye dönük uyumluluk için GEMINI_API_KEY de kontrol et
 if not GEMINI_KEYS:
     _legacy = os.environ.get('GEMINI_API_KEY', '').strip()
     if _legacy:
@@ -67,13 +65,77 @@ else:
 MODEL_NAME        = "gemini-2.5-flash"
 GOOGLE_SEARCH_URL = "https://www.googleapis.com/customsearch/v1"
 
+# ========================= FİREBASE REALTIME DATABASE =========================
+FIREBASE_URL = "https://kayastudiosai-1dfb1-default-rtdb.firebaseio.com"
+FIREBASE_REQUESTS_PATH = f"{FIREBASE_URL}/kaya_plus_requests.json"
+
+def firebase_get_all() -> list:
+    """Firebase'den tüm başvuruları çek."""
+    try:
+        resp = http_requests.get(FIREBASE_REQUESTS_PATH, timeout=10)
+        if resp.status_code != 200:
+            print(f"[FIREBASE] GET hata: {resp.status_code}")
+            return []
+        data = resp.json()
+        if not data:
+            return []
+        # Firebase dict döner: {key: {fields...}} → listeye çevir
+        result = []
+        for fb_key, val in data.items():
+            if isinstance(val, dict):
+                val['_fb_key'] = fb_key  # Firebase key'i sakla (güncelleme için)
+                result.append(val)
+        return result
+    except Exception as e:
+        print(f"[FIREBASE] GET exception: {e}")
+        return []
+
+def firebase_push(record: dict) -> str:
+    """Firebase'e yeni kayıt ekle, oluşan Firebase key'i döndür."""
+    try:
+        resp = http_requests.post(FIREBASE_REQUESTS_PATH, json=record, timeout=10)
+        if resp.status_code in (200, 201):
+            fb_key = resp.json().get('name', '')
+            print(f"[FIREBASE] ✅ Push başarılı: {fb_key}")
+            return fb_key
+        print(f"[FIREBASE] Push hata: {resp.status_code} {resp.text[:200]}")
+        return ''
+    except Exception as e:
+        print(f"[FIREBASE] Push exception: {e}")
+        return ''
+
+def firebase_update(fb_key: str, fields: dict) -> bool:
+    """Belirli bir kaydı güncelle (PATCH)."""
+    try:
+        url  = f"{FIREBASE_URL}/kaya_plus_requests/{fb_key}.json"
+        resp = http_requests.patch(url, json=fields, timeout=10)
+        if resp.status_code == 200:
+            print(f"[FIREBASE] ✅ Update başarılı: {fb_key}")
+            return True
+        print(f"[FIREBASE] Update hata: {resp.status_code} {resp.text[:200]}")
+        return False
+    except Exception as e:
+        print(f"[FIREBASE] Update exception: {e}")
+        return False
+
+def firebase_find_by_req_id(req_id: str) -> dict | None:
+    """req_id'ye göre kayıt bul."""
+    records = firebase_get_all()
+    for rec in records:
+        if rec.get('id') == req_id:
+            return rec
+    return None
+
+def firebase_find_by_email(email: str) -> dict | None:
+    """Email'e göre aktif kayıt bul."""
+    records = firebase_get_all()
+    for rec in records:
+        if rec.get('email', '').lower() == email.lower() and rec.get('status') in ('pending', 'approved'):
+            return rec
+    return None
+
 # ========================= ÇOKLU API İLE GEMİNİ ÇAĞRISI =========================
 def generate_with_fallback(parts, system_instruction):
-    """
-    GEMINI1 → GEMINI2 → GEMINI3 sırasıyla dener.
-    İlk başarılı olan API'nin sonucunu döner.
-    Hepsi başarısız olursa Exception fırlatır.
-    """
     last_error = None
     for api_info in GEMINI_KEYS:
         try:
@@ -89,46 +151,21 @@ def generate_with_fallback(parts, system_instruction):
         except Exception as e:
             last_error = e
             err_str = str(e).lower()
-            # Kota veya rate limit hatası mı?
-            if any(x in err_str for x in ['quota', 'rate', '429', 'resource exhausted',
-                                           'limit', 'exceeded', 'too many']):
-                print(f"[GEMINI] ⚠️  {api_info['name']} kota/rate limit: {e} — sonraki key deneniyor...")
+            if any(x in err_str for x in ['quota', 'rate', '429', 'resource exhausted', 'limit', 'exceeded', 'too many']):
+                print(f"[GEMINI] ⚠️  {api_info['name']} kota/rate limit — sonraki deneniyor...")
                 continue
-            # API key geçersiz mi?
-            elif any(x in err_str for x in ['api key', 'invalid', '401', '403',
-                                             'permission', 'unauthorized']):
-                print(f"[GEMINI] ⚠️  {api_info['name']} geçersiz key: {e} — sonraki key deneniyor...")
+            elif any(x in err_str for x in ['api key', 'invalid', '401', '403', 'permission', 'unauthorized']):
+                print(f"[GEMINI] ⚠️  {api_info['name']} geçersiz key — sonraki deneniyor...")
                 continue
-            # Başka bir hata — yine de devam et
             else:
-                print(f"[GEMINI] ⚠️  {api_info['name']} hata: {e} — sonraki key deneniyor...")
+                print(f"[GEMINI] ⚠️  {api_info['name']} hata: {e} — sonraki deneniyor...")
                 continue
-
-    raise Exception(f"Tüm Gemini API keyleri başarısız oldu. Son hata: {last_error}")
-
-
-def generate_simple(prompt_text):
-    """
-    Sistem talimatı gerektirmeyen basit sorgular için (başlık üretimi vb.)
-    """
-    last_error = None
-    for api_info in GEMINI_KEYS:
-        try:
-            genai.configure(api_key=api_info['key'])
-            model  = genai.GenerativeModel(model_name=MODEL_NAME)
-            result = model.generate_content(prompt_text)
-            return result.text
-        except Exception as e:
-            last_error = e
-            print(f"[GEMINI-SIMPLE] ⚠️  {api_info['name']} hata: {e}")
-            continue
-    raise Exception(f"Tüm Gemini API keyleri başarısız: {last_error}")
-
+    raise Exception(f"Tüm Gemini API keyleri başarısız. Son hata: {last_error}")
 
 # ========================= SABİTLER =========================
 MAX_MSG_LENGTH    = 4000
 MAX_IMAGE_SIZE_MB = 10
-MAX_IMAGES        = 2          # ← Tek seferde max 2 görsel
+MAX_IMAGES        = 2
 SOURCES_SEPARATOR = "|||SOURCES|||"
 
 # ========================= ARAŞTIRMA TESPİT =========================
@@ -188,14 +225,12 @@ def needs_research(text: str):
     lower = text.lower().strip()
     if len(lower) < 5:
         return False, ""
-
     for pattern in PURE_MATH_PATTERNS:
         if re.match(pattern, lower, re.IGNORECASE):
             return False, ""
     for kw in MATH_ONLY_KEYWORDS:
         if kw in lower:
             return False, ""
-
     chat_patterns = [
         r"^(merhaba|selam|nasılsın|naber|iyi\s*günler|iyi\s*akşamlar|günaydın|hey|alo)\s*[!?]?$",
         r"^teşekkür", r"^sağol", r"^ok(ey)?$", r"^tamam$", r"^anladım$",
@@ -204,7 +239,6 @@ def needs_research(text: str):
     for cp in chat_patterns:
         if re.search(cp, lower):
             return False, ""
-
     math_question_patterns = [
         r"(türev|integral|limit|matris|determinant|olasılık|permütasyon|kombinasyon)",
         r"(denklem|eşitsizlik|fonksiyon|logaritma|trigonometri|geometri|alan|hacim|çevre)",
@@ -219,7 +253,6 @@ def needs_research(text: str):
         if re.search(mp, lower, re.IGNORECASE):
             if not re.search(r"\b(kim|ne\s*zaman|hangi\s*yıl|tarihi|kimdir)\b", lower):
                 return False, ""
-
     query = text.strip()
     query = re.sub(
         r"\b(lütfen|acaba|bana\s*söyle|söyler\s*misin|öğrenebilir\s*miyim|"
@@ -227,12 +260,10 @@ def needs_research(text: str):
         "", query, flags=re.IGNORECASE
     ).strip()
     query = re.sub(r'[\r\n]+', ' ', query).strip()
-
     for pattern, ptype in RESEARCH_PATTERNS:
         if re.search(pattern, lower, re.IGNORECASE):
             print(f"[RESEARCH DETECT] type='{ptype}' query='{query}'")
             return True, query
-
     specific_question_words = (
         r"\b(kimdir|kimdi|doğdu|öldü|kuruldu|keşfetti|icat|"
         r"hangi\s*yıl|ne\s*zaman|tarihi|biyografi)\b"
@@ -240,40 +271,31 @@ def needs_research(text: str):
     if re.search(specific_question_words, lower):
         print(f"[RESEARCH DETECT] type='specific_question' query='{query}'")
         return True, query
-
     return False, ""
 
 
 def google_search(query: str, num_results: int = 5) -> list:
     api_key = os.environ.get('GOOGLE_SEARCH_API_KEY', '').strip()
     cx      = os.environ.get('GOOGLE_SEARCH_CX', '').strip()
-
     print(f"[GOOGLE] key={'VAR(' + api_key[:8] + '...)' if api_key else 'YOK'} cx='{cx}' q='{query[:60]}'")
-
     if not api_key:
         print("[GOOGLE] ❌ API KEY eksik!")
         return []
     if not cx:
         print("[GOOGLE] ❌ CX eksik!")
         return []
-
     try:
         params = {
-            "key": api_key,
-            "cx":  cx,
-            "q":   query,
-            "num": min(num_results, 10),
-            "lr":  "lang_tr",
-            "hl":  "tr",
+            "key": api_key, "cx": cx, "q": query,
+            "num": min(num_results, 10), "lr": "lang_tr", "hl": "tr",
         }
         resp = http_requests.get(GOOGLE_SEARCH_URL, params=params, timeout=10)
         print(f"[GOOGLE] HTTP {resp.status_code}")
-
         if resp.status_code == 400:
             print(f"[GOOGLE] 400: {resp.text[:300]}")
             return []
         if resp.status_code == 403:
-            print(f"[GOOGLE] 403 - Kota veya key sorunu: {resp.text[:200]}")
+            print(f"[GOOGLE] 403: {resp.text[:200]}")
             return []
         if resp.status_code == 429:
             print("[GOOGLE] 429 - Kota aşıldı")
@@ -281,18 +303,15 @@ def google_search(query: str, num_results: int = 5) -> list:
         if resp.status_code != 200:
             print(f"[GOOGLE] Hata {resp.status_code}: {resp.text[:200]}")
             return []
-
         data  = resp.json()
         items = data.get("items", [])
         print(f"[GOOGLE] ✅ {len(items)} sonuç")
-
         results = []
         for item in items:
             try:
                 domain = urlparse(item.get("link", "")).netloc.replace("www.", "")
             except Exception:
                 domain = ""
-
             snippet  = item.get("snippet", "")
             pagemap  = item.get("pagemap", {})
             metatags = pagemap.get("metatags", [])
@@ -300,7 +319,6 @@ def google_search(query: str, num_results: int = 5) -> list:
                 og_desc = metatags[0].get("og:description", "")
                 if og_desc and len(og_desc) > len(snippet):
                     snippet = og_desc
-
             results.append({
                 "title":   item.get("title", "")[:150],
                 "link":    item.get("link", ""),
@@ -308,7 +326,6 @@ def google_search(query: str, num_results: int = 5) -> list:
                 "domain":  domain,
             })
         return results
-
     except http_requests.exceptions.Timeout:
         print("[GOOGLE] ⏱ Timeout!")
         return []
@@ -326,10 +343,8 @@ def format_search_results_for_ai(results: list, query: str) -> str:
         return ""
     lines = [
         f"## Google Araştırma Sonuçları ({len(results)} kaynak)",
-        f"Arama: {query}",
-        "",
-        "Aşağıdaki güncel Google arama sonuçları, senin bilgini güncellemek ve desteklemek içindir:",
-        "",
+        f"Arama: {query}", "",
+        "Aşağıdaki güncel Google arama sonuçları, senin bilgini güncellemek ve desteklemek içindir:", "",
     ]
     for i, r in enumerate(results, 1):
         lines.append(f"**Kaynak {i}: {r['title']}**")
@@ -352,14 +367,10 @@ def get_turkey_time_info():
     months_tr = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran",
                  "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"]
     hour = now_tr.hour
-    if 5 <= hour < 12:
-        tod = "sabah"
-    elif 12 <= hour < 17:
-        tod = "öğleden sonra"
-    elif 17 <= hour < 21:
-        tod = "akşam"
-    else:
-        tod = "gece"
+    if 5 <= hour < 12:    tod = "sabah"
+    elif 12 <= hour < 17: tod = "öğleden sonra"
+    elif 17 <= hour < 21: tod = "akşam"
+    else:                  tod = "gece"
     return {
         "time_str":    now_tr.strftime("%H:%M"),
         "date_str":    f"{now_tr.day} {months_tr[now_tr.month-1]} {now_tr.year}",
@@ -376,7 +387,6 @@ def build_system_instruction(user_name=None, is_plus=False, research_context="")
         "\n- Bu kullanıcı Kaya Studios Plus üyesidir. Her konuda yardımcı ol."
         "\n- Daha detaylı ve kapsamlı cevaplar ver."
     ) if is_plus else ""
-
     research_block = ""
     if research_context:
         research_block = f"""
@@ -386,7 +396,6 @@ GÜNCEL GOOGLE ARAŞTIRMA SONUÇLARI
 {research_context}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
-
     return f"""Sen Math Canavarı'sın — Kaya Studios tarafından geliştirilen, son derece akıllı, güncel bilgilere sahip ve detaylı cevaplar veren bir yapay zeka asistanısın.
 Şu anki Türkiye saati: {time_info['full']}{greeting}
 
@@ -471,85 +480,82 @@ def check_content(message):
     return True, ""
 
 
-# ========================= VERİTABANI =========================
-REQUESTS_FILE = "kaya_plus_requests.json"
+# ========================= VERİTABANI (Firebase) =========================
+def load_requests() -> list:
+    """Firebase'den tüm başvuruları yükle."""
+    return firebase_get_all()
 
 
-def load_requests():
-    if os.path.exists(REQUESTS_FILE):
-        try:
-            with open(REQUESTS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return []
-    return []
-
-
-def save_requests(reqs):
-    with open(REQUESTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(reqs, f, ensure_ascii=False, indent=2)
-
-
-def add_request(name, surname, email):
+def add_request(name: str, surname: str, email: str) -> str:
+    """Yeni başvuru ekle, req_id döndür."""
     req_id = str(uuid.uuid4())
-    reqs   = load_requests()
-    reqs.append({
+    record = {
         "id":        req_id,
         "name":      name,
         "surname":   surname,
         "email":     email,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "status":    "pending",
-    })
-    save_requests(reqs)
+    }
+    fb_key = firebase_push(record)
+    if not fb_key:
+        raise Exception("Firebase'e kayıt eklenemedi.")
     return req_id
 
 
-def update_request_status(req_id, status):
-    reqs = load_requests()
-    for req in reqs:
-        if req["id"] == req_id:
-            req["status"]     = status
-            req["updated_at"] = datetime.now(timezone.utc).isoformat()
-            save_requests(reqs)
-            return True
-    return False
+def update_request_status(req_id: str, status: str) -> bool:
+    """req_id ile kaydı bul ve durumunu güncelle."""
+    rec = firebase_find_by_req_id(req_id)
+    if not rec:
+        return False
+    fb_key = rec.get('_fb_key')
+    if not fb_key:
+        return False
+    return firebase_update(fb_key, {
+        "status":     status,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
 
 
-def email_already_applied(email):
-    reqs = load_requests()
-    for req in reqs:
-        if req["email"].lower() == email.lower() and req["status"] in ("pending", "approved"):
-            return True, req["status"]
+def email_already_applied(email: str):
+    rec = firebase_find_by_email(email)
+    if rec:
+        return True, rec.get('status')
     return False, None
 
 
-def cancel_by_req_id(req_id):
-    reqs = load_requests()
-    for req in reqs:
-        if req["id"] == req_id:
-            if req["status"] != "approved":
-                return False, "sadece_approved"
-            req["status"]       = "cancelled"
-            req["cancelled_at"] = datetime.now(timezone.utc).isoformat()
-            req["cancelled_by"] = "user"
-            save_requests(reqs)
-            return True, "ok"
-    return False, "bulunamadi"
+def cancel_by_req_id(req_id: str):
+    rec = firebase_find_by_req_id(req_id)
+    if not rec:
+        return False, "bulunamadi"
+    if rec.get('status') != 'approved':
+        return False, "sadece_approved"
+    fb_key = rec.get('_fb_key')
+    if not fb_key:
+        return False, "bulunamadi"
+    ok = firebase_update(fb_key, {
+        "status":       "cancelled",
+        "cancelled_at": datetime.now(timezone.utc).isoformat(),
+        "cancelled_by": "user",
+    })
+    return (True, "ok") if ok else (False, "guncelleme_hatasi")
 
 
-def cancel_by_admin(req_id):
-    reqs = load_requests()
-    for req in reqs:
-        if req["id"] == req_id:
-            if req["status"] not in ("approved", "pending"):
-                return False, "gecersiz_durum"
-            req["status"]       = "cancelled"
-            req["cancelled_at"] = datetime.now(timezone.utc).isoformat()
-            req["cancelled_by"] = "admin"
-            save_requests(reqs)
-            return True, "ok"
-    return False, "bulunamadi"
+def cancel_by_admin(req_id: str):
+    rec = firebase_find_by_req_id(req_id)
+    if not rec:
+        return False, "bulunamadi"
+    if rec.get('status') not in ('approved', 'pending'):
+        return False, "gecersiz_durum"
+    fb_key = rec.get('_fb_key')
+    if not fb_key:
+        return False, "bulunamadi"
+    ok = firebase_update(fb_key, {
+        "status":       "cancelled",
+        "cancelled_at": datetime.now(timezone.utc).isoformat(),
+        "cancelled_by": "admin",
+    })
+    return (True, "ok") if ok else (False, "guncelleme_hatasi")
 
 
 # ========================= ADMİN HTML =========================
@@ -585,6 +591,7 @@ ADMIN_HTML = """
         .cancelled-by{font-size:.72rem;color:#888;margin-top:2px;}
         .search-status{background:#1a2a3a;border:1px solid #00f0ff33;border-radius:8px;padding:8px 14px;font-size:.8rem;color:#60a5fa;margin-bottom:16px;}
         .api-status{background:#1a2a1a;border:1px solid #44ff8833;border-radius:8px;padding:8px 14px;font-size:.8rem;color:#44ff88;margin-bottom:16px;}
+        .firebase-status{background:#1a1a2a;border:1px solid #a78bfa33;border-radius:8px;padding:8px 14px;font-size:.8rem;color:#a78bfa;margin-bottom:16px;}
     </style>
 </head>
 <body>
@@ -592,102 +599,147 @@ ADMIN_HTML = """
     <h1>🛡️ Kaya Studios Plus Admin Paneli</h1>
     <div class="time-info" id="timeInfo"></div>
     <div class="api-status" id="apiStatus">Gemini API durumu kontrol ediliyor...</div>
+    <div class="firebase-status" id="firebaseStatus">🔥 Firebase bağlantısı kontrol ediliyor...</div>
     <div class="search-status" id="searchStatus">Google Arama Durumu kontrol ediliyor...</div>
     <div class="stats" id="statsArea"></div>
     <button class="refresh-btn" onclick="fetchRequests()">🔄 Yenile</button>
     <div id="message"></div>
     <table id="requestsTable">
-        <thead><tr><th>Ad Soyad</th><th>Email</th><th>Başvuru Tarihi</th><th>Durum</th><th>İşlem</th></tr></thead>
+        <thead>
+            <tr>
+                <th>Ad Soyad</th>
+                <th>Email</th>
+                <th>Başvuru Tarihi</th>
+                <th>Durum</th>
+                <th>İşlem</th>
+            </tr>
+        </thead>
         <tbody></tbody>
     </table>
 </div>
 <script>
-const API_BASE=window.location.origin;
-const TOKEN=new URLSearchParams(window.location.search).get('token');
-function updateClock(){
-    document.getElementById('timeInfo').textContent='Türkiye Saati: '+
-    new Date().toLocaleString('tr-TR',{timeZone:'Europe/Istanbul',weekday:'long',
-    year:'numeric',month:'long',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'});
+const API_BASE = window.location.origin;
+const TOKEN    = new URLSearchParams(window.location.search).get('token');
+
+function updateClock() {
+    document.getElementById('timeInfo').textContent = 'Türkiye Saati: ' +
+        new Date().toLocaleString('tr-TR', {
+            timeZone:'Europe/Istanbul', weekday:'long',
+            year:'numeric', month:'long', day:'numeric',
+            hour:'2-digit', minute:'2-digit', second:'2-digit'
+        });
 }
-updateClock();setInterval(updateClock,1000);
-async function checkApiStatus(){
-    try{
-        const res=await fetch(`${API_BASE}/health`);
-        const data=await res.json();
-        const el=document.getElementById('apiStatus');
-        el.textContent='🤖 Gemini API: '+data.gemini_keys_count+' key aktif | Model: '+data.model;
-    }catch(e){}
+updateClock(); setInterval(updateClock, 1000);
+
+async function checkApiStatus() {
+    try {
+        const res  = await fetch(`${API_BASE}/health`);
+        const data = await res.json();
+        const el   = document.getElementById('apiStatus');
+        el.textContent = '🤖 Gemini API: ' + data.gemini_keys_count + ' key aktif | Model: ' + data.model;
+    } catch(e) {}
 }
-async function checkSearchStatus(){
-    try{
-        const res=await fetch(`${API_BASE}/search-status?token=${TOKEN}`);
-        const data=await res.json();
-        const el=document.getElementById('searchStatus');
-        if(data.configured){
-            el.style.borderColor='#44ff8844';el.style.color='#44ff88';
-            el.textContent='✅ Google Custom Search API aktif';
-        }else{
-            el.style.borderColor='#ff666644';el.style.color='#ff9999';
-            el.textContent='⚠️ Google API yapılandırılmamış!';
+
+async function checkFirebaseStatus() {
+    try {
+        const res = await fetch(`${API_BASE}/firebase-status?token=${TOKEN}`);
+        const data = await res.json();
+        const el   = document.getElementById('firebaseStatus');
+        if (data.connected) {
+            el.style.borderColor = '#44ff8844'; el.style.color = '#44ff88';
+            el.textContent = '🔥 Firebase Realtime Database bağlı — ' + data.record_count + ' kayıt';
+        } else {
+            el.style.borderColor = '#ff666644'; el.style.color = '#ff9999';
+            el.textContent = '⚠️ Firebase bağlantı hatası!';
         }
-    }catch(e){}
+    } catch(e) {}
 }
-async function fetchRequests(){
-    const res=await fetch(`${API_BASE}/admin/requests?token=${TOKEN}`);
-    if(!res.ok){showMessage('Yetkisiz erişim veya hata','error');return;}
-    const data=await res.json();renderStats(data);renderTable(data);
+
+async function checkSearchStatus() {
+    try {
+        const res  = await fetch(`${API_BASE}/search-status?token=${TOKEN}`);
+        const data = await res.json();
+        const el   = document.getElementById('searchStatus');
+        if (data.configured) {
+            el.style.borderColor = '#44ff8844'; el.style.color = '#44ff88';
+            el.textContent = '✅ Google Custom Search API aktif';
+        } else {
+            el.style.borderColor = '#ff666644'; el.style.color = '#ff9999';
+            el.textContent = '⚠️ Google API yapılandırılmamış!';
+        }
+    } catch(e) {}
 }
-function renderStats(r){
-    const t=r.length,p=r.filter(x=>x.status==='pending').length,
-    a=r.filter(x=>x.status==='approved').length,
-    rj=r.filter(x=>x.status==='rejected').length,
-    c=r.filter(x=>x.status==='cancelled').length;
-    document.getElementById('statsArea').innerHTML=
-    `<div class="stat-card"><div class="num">${t}</div><div class="lbl">Toplam</div></div>
-     <div class="stat-card"><div class="num" style="color:#ffaa44">${p}</div><div class="lbl">Bekliyor</div></div>
-     <div class="stat-card"><div class="num" style="color:#44ff88">${a}</div><div class="lbl">Onaylı</div></div>
-     <div class="stat-card"><div class="num" style="color:#ff6666">${rj}</div><div class="lbl">Reddedildi</div></div>
-     <div class="stat-card"><div class="num" style="color:#aaa">${c}</div><div class="lbl">İptal</div></div>`;
+
+async function fetchRequests() {
+    const res = await fetch(`${API_BASE}/admin/requests?token=${TOKEN}`);
+    if (!res.ok) { showMessage('Yetkisiz erişim veya hata', 'error'); return; }
+    const data = await res.json();
+    renderStats(data); renderTable(data);
 }
-function renderTable(requests){
-    const tbody=document.querySelector('#requestsTable tbody');tbody.innerHTML='';
-    [...requests].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)).forEach(req=>{
-        const row=tbody.insertRow();
-        row.insertCell(0).textContent=`${req.name} ${req.surname}`;
-        row.insertCell(1).textContent=req.email;
-        row.insertCell(2).textContent=new Date(req.timestamp).toLocaleString('tr-TR',{timeZone:'Europe/Istanbul'});
-        const labels={pending:'Bekliyor',approved:'Onaylandı',rejected:'Reddedildi',cancelled:'İptal Edildi'};
-        const sc=row.insertCell(3);
-        let sh=`<span class="status-${req.status}">${labels[req.status]||req.status}</span>`;
-        if(req.status==='cancelled'&&req.cancelled_by)
-            sh+=`<div class="cancelled-by">${req.cancelled_by==='user'?'👤 Kullanıcı':'🛡️ Admin'} iptal etti</div>`;
-        sc.innerHTML=sh;
-        const ac=row.insertCell(4);
-        if(req.status==='pending')
-            ac.innerHTML=`<button class="approve" onclick="updateStatus('${req.id}','approved')">✅ Onayla</button>
-                          <button class="reject" onclick="updateStatus('${req.id}','rejected')">❌ Reddet</button>`;
-        else if(req.status==='approved')
-            ac.innerHTML=`<button class="cancel-btn" onclick="adminCancel('${req.id}')">🚫 İptal Et</button>`;
-        else ac.innerHTML='<span style="color:#555">—</span>';
+
+function renderStats(r) {
+    const t  = r.length;
+    const p  = r.filter(x => x.status === 'pending').length;
+    const a  = r.filter(x => x.status === 'approved').length;
+    const rj = r.filter(x => x.status === 'rejected').length;
+    const c  = r.filter(x => x.status === 'cancelled').length;
+    document.getElementById('statsArea').innerHTML =
+        `<div class="stat-card"><div class="num">${t}</div><div class="lbl">Toplam</div></div>
+         <div class="stat-card"><div class="num" style="color:#ffaa44">${p}</div><div class="lbl">Bekliyor</div></div>
+         <div class="stat-card"><div class="num" style="color:#44ff88">${a}</div><div class="lbl">Onaylı</div></div>
+         <div class="stat-card"><div class="num" style="color:#ff6666">${rj}</div><div class="lbl">Reddedildi</div></div>
+         <div class="stat-card"><div class="num" style="color:#aaa">${c}</div><div class="lbl">İptal</div></div>`;
+}
+
+function renderTable(requests) {
+    const tbody = document.querySelector('#requestsTable tbody');
+    tbody.innerHTML = '';
+    [...requests].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)).forEach(req => {
+        const row = tbody.insertRow();
+        row.insertCell(0).textContent = `${req.name} ${req.surname}`;
+        row.insertCell(1).textContent = req.email;
+        row.insertCell(2).textContent = new Date(req.timestamp).toLocaleString('tr-TR', {timeZone:'Europe/Istanbul'});
+        const labels = {pending:'Bekliyor', approved:'Onaylandı', rejected:'Reddedildi', cancelled:'İptal Edildi'};
+        const sc = row.insertCell(3);
+        let sh = `<span class="status-${req.status}">${labels[req.status] || req.status}</span>`;
+        if (req.status === 'cancelled' && req.cancelled_by)
+            sh += `<div class="cancelled-by">${req.cancelled_by === 'user' ? '👤 Kullanıcı' : '🛡️ Admin'} iptal etti</div>`;
+        sc.innerHTML = sh;
+        const ac = row.insertCell(4);
+        if (req.status === 'pending')
+            ac.innerHTML = `<button class="approve" onclick="updateStatus('${req.id}','approved')">✅ Onayla</button>
+                            <button class="reject"  onclick="updateStatus('${req.id}','rejected')">❌ Reddet</button>`;
+        else if (req.status === 'approved')
+            ac.innerHTML = `<button class="cancel-btn" onclick="adminCancel('${req.id}')">🚫 İptal Et</button>`;
+        else
+            ac.innerHTML = '<span style="color:#555">—</span>';
     });
 }
-async function updateStatus(id,s){
-    const res=await fetch(`${API_BASE}/admin/request/${id}?token=${TOKEN}&status=${s}`,{method:'POST'});
-    showMessage(res.ok?'Durum güncellendi.':'Hata',res.ok?'success':'error');
-    if(res.ok)fetchRequests();
+
+async function updateStatus(id, s) {
+    const res = await fetch(`${API_BASE}/admin/request/${id}?token=${TOKEN}&status=${s}`, {method:'POST'});
+    showMessage(res.ok ? 'Durum güncellendi.' : 'Hata', res.ok ? 'success' : 'error');
+    if (res.ok) fetchRequests();
 }
-async function adminCancel(id){
-    if(!confirm('Üyeliği iptal etmek istediğinizden emin misiniz?'))return;
-    const res=await fetch(`${API_BASE}/admin/cancel/${id}?token=${TOKEN}`,{method:'POST'});
-    showMessage(res.ok?'İptal edildi.':`Hata: ${await res.text()}`,res.ok?'success':'error');
-    if(res.ok)fetchRequests();
+
+async function adminCancel(id) {
+    if (!confirm('Üyeliği iptal etmek istediğinizden emin misiniz?')) return;
+    const res = await fetch(`${API_BASE}/admin/cancel/${id}?token=${TOKEN}`, {method:'POST'});
+    showMessage(res.ok ? 'İptal edildi.' : `Hata: ${await res.text()}`, res.ok ? 'success' : 'error');
+    if (res.ok) fetchRequests();
 }
-function showMessage(msg,type){
-    const d=document.getElementById('message');
-    d.innerHTML=`<div class="${type}">${msg}</div>`;
-    setTimeout(()=>d.innerHTML='',3000);
+
+function showMessage(msg, type) {
+    const d = document.getElementById('message');
+    d.innerHTML = `<div class="${type}">${msg}</div>`;
+    setTimeout(() => d.innerHTML = '', 3000);
 }
-checkApiStatus();checkSearchStatus();fetchRequests();setInterval(fetchRequests,30000);
+
+checkApiStatus();
+checkFirebaseStatus();
+checkSearchStatus();
+fetchRequests();
+setInterval(fetchRequests, 30000);
 </script>
 </body>
 </html>
@@ -702,7 +754,8 @@ def index():
     return Response(
         f"Math Canavari API v5.0\n"
         f"Gemini Keys: {len(GEMINI_KEYS)} adet\n"
-        f"Google Search: {'OK' if (gk and cx) else 'MISSING'}",
+        f"Google Search: {'OK' if (gk and cx) else 'MISSING'}\n"
+        f"Firebase: {FIREBASE_URL}",
         status=200, content_type='text/plain; charset=utf-8'
     )
 
@@ -722,7 +775,23 @@ def health():
         "google_key_set":    gk,
         "google_cx_set":     cx,
         "max_images":        MAX_IMAGES,
+        "firebase_url":      FIREBASE_URL,
     })
+
+
+@app.route("/firebase-status", methods=["GET"])
+def firebase_status():
+    if request.args.get("token") != "KAYAADMIN":
+        return Response("Yetkisiz erişim", status=401)
+    try:
+        records = firebase_get_all()
+        return jsonify({
+            "connected":    True,
+            "record_count": len(records),
+            "firebase_url": FIREBASE_URL,
+        })
+    except Exception as e:
+        return jsonify({"connected": False, "error": str(e)})
 
 
 @app.route("/debug-env", methods=["GET"])
@@ -736,6 +805,7 @@ def debug_env():
         "GOOGLE_SEARCH_API_KEY_prefix": (gk[:10] + "...") if gk else "YOK",
         "GOOGLE_SEARCH_CX_set":         bool(cx),
         "GOOGLE_SEARCH_CX_value":       cx if cx else "YOK",
+        "firebase_url":                 FIREBASE_URL,
     })
 
 
@@ -768,13 +838,12 @@ def chat():
         user_name    = request.form.get('user_name', '').strip()
         is_plus      = request.form.get('is_plus', 'false').lower() == 'true'
 
-        # ─── ÇOKLU GÖRSEL KONTROLÜ (max 2) ───
+        # ─── ÇOKLU GÖRSEL KONTROLÜ ───
         image_files = request.files.getlist('image')
-        # Eski tekli 'image' field da destekle
-        single_image = request.files.get('image')
-        if single_image and not image_files:
-            image_files = [single_image]
-        # Boş dosyaları filtrele
+        if not image_files:
+            single = request.files.get('image')
+            if single:
+                image_files = [single]
         image_files = [f for f in image_files if f and f.filename]
 
         if len(image_files) > MAX_IMAGES:
@@ -846,7 +915,7 @@ def chat():
         if not parts:
             return Response("İçerik işlenemedi!", status=400)
 
-        # ─── AI YANITI (Çoklu API fallback) ───
+        # ─── AI YANITI ───
         system_inst = build_system_instruction(
             user_name=user_name or None,
             is_plus=is_plus,
@@ -871,11 +940,7 @@ def chat():
             "query":     search_query,
             "count":     len(search_results),
             "sources": [
-                {
-                    "title":  r["title"],
-                    "domain": r["domain"],
-                    "link":   r["link"],
-                }
+                {"title": r["title"], "domain": r["domain"], "link": r["link"]}
                 for r in search_results[:5]
             ],
         }
@@ -899,24 +964,16 @@ def manual_search():
         data  = request.get_json() or {}
         query = data.get("q", "").strip()
         num   = min(int(data.get("num", 5)), 10)
-
     if not query:
         return jsonify({"error": "q parametresi gerekli"}), 400
-
     ip = get_client_ip()
     allowed, err = check_rate_limit_chat(ip)
     if not allowed:
         return Response(err, status=429)
-
     results = google_search(query, num_results=num)
     gk = bool(os.environ.get('GOOGLE_SEARCH_API_KEY', '').strip())
     cx = bool(os.environ.get('GOOGLE_SEARCH_CX', '').strip())
-    return jsonify({
-        "query":          query,
-        "count":          len(results),
-        "results":        results,
-        "api_configured": gk and cx,
-    })
+    return jsonify({"query": query, "count": len(results), "results": results, "api_configured": gk and cx})
 
 
 @app.route("/vision", methods=["POST", "OPTIONS"])
@@ -934,16 +991,13 @@ def analyze_image():
             if single:
                 image_files = [single]
         image_files = [f for f in image_files if f and f.filename]
-
         if not image_files:
             return Response("Resim dosyası gerekli.", status=400)
         if len(image_files) > MAX_IMAGES:
             return Response(f"En fazla {MAX_IMAGES} görsel gönderilebilir.", status=400)
-
         custom_prompt = request.form.get('prompt', '').strip() or (
             "Bu resmi dikkatlice analiz et. Matematik problemi varsa adım adım çöz. Türkçe yanıtla. LaTeX kullan."
         )
-
         parts = []
         for img_file in image_files:
             img_data = img_file.read()
@@ -954,14 +1008,11 @@ def analyze_image():
             img = Image.open(BytesIO(img_data))
             img.thumbnail((1024, 1024), Image.LANCZOS)
             parts.append(img)
-
         parts.append(custom_prompt)
-
         try:
             result_text = generate_with_fallback(parts, None)
         except Exception as e:
             return Response(f"AI servisi meşgul: {str(e)}", status=503)
-
         return Response(result_text, status=200, content_type='text/plain; charset=utf-8')
     except Exception as e:
         print(f"[VISION] HATA: {e}")
@@ -995,7 +1046,11 @@ def kaya_plus_request():
                if status == "approved"
                else "Bu email ile bekleyen bir başvurunuz var.")
         return Response(msg, status=409)
-    req_id = add_request(name, surname, email)
+    try:
+        req_id = add_request(name, surname, email)
+    except Exception as e:
+        print(f"[PLUS REQUEST] Firebase hatası: {e}")
+        return Response("Sunucu hatası, lütfen tekrar deneyin.", status=500)
     return jsonify({"message": "Başvuru alındı.", "req_id": req_id}), 200
 
 
@@ -1008,16 +1063,15 @@ def check_plus_status():
         uuid.UUID(req_id)
     except ValueError:
         return Response("Geçersiz req_id.", status=400)
-    reqs = load_requests()
-    for req in reqs:
-        if req["id"] == req_id:
-            return jsonify({
-                "status":       req["status"],
-                "name":         req["name"],
-                "surname":      req["surname"],
-                "cancelled_by": req.get("cancelled_by", ""),
-            }), 200
-    return Response("Başvuru bulunamadı.", status=404)
+    rec = firebase_find_by_req_id(req_id)
+    if not rec:
+        return Response("Başvuru bulunamadı.", status=404)
+    return jsonify({
+        "status":       rec.get("status", ""),
+        "name":         rec.get("name", ""),
+        "surname":      rec.get("surname", ""),
+        "cancelled_by": rec.get("cancelled_by", ""),
+    }), 200
 
 
 @app.route("/cancel-plus", methods=["POST"])
@@ -1072,7 +1126,10 @@ def admin_panel():
 def admin_get_requests():
     if request.args.get("token") != "KAYAADMIN":
         return Response("Yetkisiz erişim.", status=401)
-    return jsonify(load_requests())
+    records = load_requests()
+    # _fb_key alanını dışarıya gönderme
+    clean = [{k: v for k, v in r.items() if k != '_fb_key'} for r in records]
+    return jsonify(clean)
 
 
 @app.route("/admin/request/<req_id>", methods=["POST"])
@@ -1099,8 +1156,9 @@ if __name__ == "__main__":
     print(f"Gemini Keys: {len(GEMINI_KEYS)} adet → {[k['name'] for k in GEMINI_KEYS]}")
     gk = os.environ.get('GOOGLE_SEARCH_API_KEY', '').strip()
     cx = os.environ.get('GOOGLE_SEARCH_CX', '').strip()
-    print(f"Google Key: {'✅' if gk else '❌ YOK'}")
-    print(f"Google CX:  {'✅ (' + cx + ')' if cx else '❌ YOK'}")
-    print(f"Max Görsel: {MAX_IMAGES} adet")
+    print(f"Google Key:  {'✅' if gk else '❌ YOK'}")
+    print(f"Google CX:   {'✅ (' + cx + ')' if cx else '❌ YOK'}")
+    print(f"Firebase:    {FIREBASE_URL}")
+    print(f"Max Görsel:  {MAX_IMAGES} adet")
     print("=" * 55)
     app.run(host='0.0.0.0', port=port, debug=False)
