@@ -757,14 +757,14 @@ def chat():
 # chat() route'unda, full_response oluşturmadan önce:
 
 # AI'nın kendi ürettiği metinde ayraç varsa temizle
-ai_text_clean = ai_text.replace(SOURCES_SEPARATOR, "").strip()
+        ai_text_clean = ai_text.replace(SOURCES_SEPARATOR, "").strip()
 
-sources_payload = {
-    "performed": search_performed and len(search_results) > 0,
-    "query":     search_query,
-    "count":     len(search_results),
-    "sources": [
-        {
+        sources_payload = {
+            "performed": search_performed and len(search_results) > 0,
+            "query":     search_query,
+            "count":     len(search_results),
+            "sources": [
+         {
             "title":  r["title"],
             "domain": r["domain"],
             "link":   r["link"],
