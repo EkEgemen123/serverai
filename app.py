@@ -120,12 +120,14 @@ def clean_for_header(text: str, max_len: int = 100) -> str:
     return cleaned[:max_len]
 
 
+# needs_research() fonksiyonunu şöyle değiştir:
+
 def needs_research(text: str):
     lower = text.lower().strip()
     if len(lower) < 5:
         return False, ""
 
-    # 1. Tamamen matematiksel bir ifade veya işlem komutu mu?
+    # 1. Saf matematik kontrolü
     for pattern in PURE_MATH_PATTERNS:
         if re.match(pattern, lower, re.IGNORECASE):
             return False, ""
@@ -133,38 +135,56 @@ def needs_research(text: str):
         if kw in lower:
             return False, ""
 
-    # 2. Sohbet/Selamlaşma ise araştırma yapma
-    chat_patterns = [r"^(merhaba|selam|nasılsın|naber|iyi\s*günler|iyi\s*akşamlar|günaydın|hey|alo)$", r"^teşekkür", r"^sağol", r"^ok(ey)?$"]
+    # 2. Sohbet/selamlaşma
+    chat_patterns = [
+        r"^(merhaba|selam|nasılsın|naber|iyi\s*günler|iyi\s*akşamlar|günaydın|hey|alo)\s*[!?]?$",
+        r"^teşekkür", r"^sağol", r"^ok(ey)?$", r"^tamam$", r"^anladım$",
+        r"^(evet|hayır|belki|tabii|tabi|kesinlikle)\s*$",
+    ]
     for cp in chat_patterns:
         if re.search(cp, lower):
             return False, ""
 
+    # 3. Matematik sorusu mu? (Araştırma YAPMA)
+    math_question_patterns = [
+        r"(türev|integral|limit|matris|determinant|olasılık|permütasyon|kombinasyon)",
+        r"(denklem|eşitsizlik|fonksiyon|logaritma|trigonometri|geometri|alan|hacim|çevre)",
+        r"(ispat|kanıtla|göster|bul|hesapla|çöz|sadeleştir|basitleştir|çarpanlarına)",
+        r"(karekök|mutlak\s*değer|üslü|köklü|kesir|oran|orantı)",
+        r"(açı|üçgen|dörtgen|çember|daire|dikdörtgen|kare|paralel|dik)",
+        r"^\d+[\+\-\*\/\^]\d+",
+        r"x\s*[\+\-\*\/\^=]\s*\d",  # x içeren denklemler
+        r"f\s*\(",  # f(x) notation
+    ]
+    for mp in math_question_patterns:
+        if re.search(mp, lower, re.IGNORECASE):
+            # Ama kişi/tarih sorusu değilse
+            if not re.search(r"\b(kim|ne\s*zaman|hangi\s*yıl|tarihi|kimdir)\b", lower):
+                return False, ""
+
     query = text.strip()
     query = re.sub(
-        r"\b(lütfen|acaba|bana\s*söyle|söyler\s*misin|öğrenebilir\s*miyim|merak\s*ediyorum|bana\s*anlat)\b",
+        r"\b(lütfen|acaba|bana\s*söyle|söyler\s*misin|öğrenebilir\s*miyim|"
+        r"merak\s*ediyorum|bana\s*anlat)\b",
         "", query, flags=re.IGNORECASE
     ).strip()
     query = re.sub(r'[\r\n]+', ' ', query).strip()
 
-    # 3. Bilinen özel araştırma şablonlarından biri mi?
+    # 4. Bilinen araştırma şablonları
     for pattern, ptype in RESEARCH_PATTERNS:
         if re.search(pattern, lower, re.IGNORECASE):
             print(f"[RESEARCH DETECT] type='{ptype}' query='{query}'")
             return True, query
 
-    # 4. Genel soru kalıplarına uyuyorsa (kim, nerede, kaç, nedir vb.) araştır.
-    general_question_words = r"\b(kim|nedir|ne|nerede|nasıl|ne\s*zaman|kaç|hangisi|hakkında|kimdir|neden|niçin|fiyatı|son\s*durum|maçı)\b"
-    if re.search(general_question_words, lower):
-        print(f"[RESEARCH DETECT] type='general_question' query='{query}'")
+    # 5. Genel soru — ama SADECE kişi/tarih/olay içeriyorsa
+    # "ne" tek başına araştırma tetiklememeli!
+    specific_question_words = r"\b(kimdir|kimdi|doğdu|öldü|kuruldu|keşfetti|icat|hangi\s*yıl|ne\s*zaman|tarihi|biyografi)\b"
+    if re.search(specific_question_words, lower):
+        print(f"[RESEARCH DETECT] type='specific_question' query='{query}'")
         return True, query
 
-    # İçinde soru işareti varsa araştır
-    if "?" in lower:
-        print(f"[RESEARCH DETECT] type='question_mark' query='{query}'")
-        return True, query
-
+    # ❌ Artık genel "?" veya "ne" araştırma tetiklemiyor
     return False, ""
-
 
 def google_search(query: str, num_results: int = 5) -> list[dict]:
     api_key = os.environ.get('GOOGLE_SEARCH_API_KEY', '').strip()
@@ -734,25 +754,26 @@ def chat():
         )
         model   = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=system_inst)
         result  = model.generate_content(parts)
-        ai_text = result.text
+# chat() route'unda, full_response oluşturmadan önce:
 
-        # ─── KAYNAKLARI BODY'YE GÖM — header sorunu YOK ───
-        # Format: <AI_YANITI>|||SOURCES|||<JSON>
-        sources_payload = {
-            "performed": search_performed and len(search_results) > 0,
-            "query":     search_query,
-            "count":     len(search_results),
-            "sources": [
-                {
-                    "title":  r["title"],
-                    "domain": r["domain"],
-                    "link":   r["link"],
-                }
-                for r in search_results[:5]
-            ],
+# AI'nın kendi ürettiği metinde ayraç varsa temizle
+ai_text_clean = ai_text.replace(SOURCES_SEPARATOR, "").strip()
+
+sources_payload = {
+    "performed": search_performed and len(search_results) > 0,
+    "query":     search_query,
+    "count":     len(search_results),
+    "sources": [
+        {
+            "title":  r["title"],
+            "domain": r["domain"],
+            "link":   r["link"],
         }
-        sources_json  = json.dumps(sources_payload, ensure_ascii=False)
-        full_response = ai_text + SOURCES_SEPARATOR + sources_json
+        for r in search_results[:5]
+    ],
+}
+sources_json  = json.dumps(sources_payload, ensure_ascii=False, separators=(',', ':'))
+full_response = ai_text_clean + SOURCES_SEPARATOR + sources_json
 
         return Response(full_response, status=200, content_type='text/plain; charset=utf-8')
 
