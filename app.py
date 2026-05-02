@@ -285,6 +285,7 @@ def google_search(query: str, num_results: int = 5) -> list:
         }
         resp = http_requests.get(GOOGLE_SEARCH_URL, params=params, timeout=10)
         print(f"[GOOGLE] HTTP {resp.status_code}")
+        print(f"[GOOGLE] RAW RESPONSE: {resp.text[:2000]}")
         if resp.status_code == 400:
             print(f"[GOOGLE] 400: {resp.text[:300]}")
             return []
