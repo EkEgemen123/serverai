@@ -70,7 +70,6 @@ FIREBASE_URL = "https://kayastudiosai-1dfb1-default-rtdb.firebaseio.com"
 FIREBASE_REQUESTS_PATH = f"{FIREBASE_URL}/kaya_plus_requests.json"
 
 def firebase_get_all() -> list:
-    """Firebase'den tüm başvuruları çek."""
     try:
         resp = http_requests.get(FIREBASE_REQUESTS_PATH, timeout=10)
         if resp.status_code != 200:
@@ -79,11 +78,10 @@ def firebase_get_all() -> list:
         data = resp.json()
         if not data:
             return []
-        # Firebase dict döner: {key: {fields...}} → listeye çevir
         result = []
         for fb_key, val in data.items():
             if isinstance(val, dict):
-                val['_fb_key'] = fb_key  # Firebase key'i sakla (güncelleme için)
+                val['_fb_key'] = fb_key
                 result.append(val)
         return result
     except Exception as e:
@@ -91,7 +89,6 @@ def firebase_get_all() -> list:
         return []
 
 def firebase_push(record: dict) -> str:
-    """Firebase'e yeni kayıt ekle, oluşan Firebase key'i döndür."""
     try:
         resp = http_requests.post(FIREBASE_REQUESTS_PATH, json=record, timeout=10)
         if resp.status_code in (200, 201):
@@ -105,7 +102,6 @@ def firebase_push(record: dict) -> str:
         return ''
 
 def firebase_update(fb_key: str, fields: dict) -> bool:
-    """Belirli bir kaydı güncelle (PATCH)."""
     try:
         url  = f"{FIREBASE_URL}/kaya_plus_requests/{fb_key}.json"
         resp = http_requests.patch(url, json=fields, timeout=10)
@@ -119,7 +115,6 @@ def firebase_update(fb_key: str, fields: dict) -> bool:
         return False
 
 def firebase_find_by_req_id(req_id: str) -> dict | None:
-    """req_id'ye göre kayıt bul."""
     records = firebase_get_all()
     for rec in records:
         if rec.get('id') == req_id:
@@ -127,7 +122,6 @@ def firebase_find_by_req_id(req_id: str) -> dict | None:
     return None
 
 def firebase_find_by_email(email: str) -> dict | None:
-    """Email'e göre aktif kayıt bul."""
     records = firebase_get_all()
     for rec in records:
         if rec.get('email', '').lower() == email.lower() and rec.get('status') in ('pending', 'approved'):
@@ -412,15 +406,16 @@ KURALLAR:
 
 
 # ========================= RATE LİMİTİNG =========================
-ip_request_log  = defaultdict(list)
-ip_plus_req_log = defaultdict(list)
-ip_last_request = defaultdict(float)
-ip_last_msgs    = defaultdict(list)
+# ★ Her IP'nin son başarılı mesaj zamanını tut
+ip_last_request  = defaultdict(float)   # son istek zamanı (flood kontrolü)
+ip_last_success  = defaultdict(float)   # son BAŞARILI chat zamanı (15 sn kota)
+ip_plus_req_log  = defaultdict(list)
+ip_last_msgs     = defaultdict(list)
 
-RATE_LIMIT_WINDOW   = 60
-RATE_LIMIT_MAX_CHAT = 20
+# ★ Kota ayarları
+COOLDOWN_SECONDS  = 15          # mesajlar arası zorunlu bekleme süresi
+MIN_MSG_INTERVAL  = 0.5         # flood koruması (çok hızlı art arda istek)
 RATE_LIMIT_MAX_PLUS = 3
-MIN_MSG_INTERVAL    = 1.5
 SPAM_REPEAT_LIMIT   = 3
 
 FORBIDDEN_PATTERNS = [
@@ -437,24 +432,40 @@ def get_client_ip():
     return fwd.split(',')[0].strip() if fwd else (request.remote_addr or '0.0.0.0')
 
 
-def check_rate_limit_chat(ip):
-    now  = time.time()
+def check_rate_limit_chat(ip: str):
+    """
+    Her mesajlar arası en az COOLDOWN_SECONDS (15 sn) beklenmesi zorunlu.
+    Kaç saniye kaldığını da mesaja ekle.
+    """
+    now = time.time()
+
+    # Flood koruması: aynı IP'den çok hızlı art arda istek (0.5 sn)
     last = ip_last_request[ip]
     if now - last < MIN_MSG_INTERVAL:
-        wait = round(MIN_MSG_INTERVAL - (now - last), 1)
-        return False, f"Çok hızlı mesaj gönderiyorsunuz. {wait} saniye bekleyin."
-    log = [t for t in ip_request_log[ip] if now - t < RATE_LIMIT_WINDOW]
-    ip_request_log[ip] = log
-    if len(log) >= RATE_LIMIT_MAX_CHAT:
-        return False, f"Dakikada en fazla {RATE_LIMIT_MAX_CHAT} mesaj gönderebilirsiniz."
-    ip_request_log[ip].append(now)
+        return False, "Çok hızlı istek. Lütfen bir an bekleyin."
     ip_last_request[ip] = now
+
+    # ★ 15 saniyelik cooldown kontrolü
+    last_success = ip_last_success[ip]
+    elapsed      = now - last_success
+    if last_success > 0 and elapsed < COOLDOWN_SECONDS:
+        remaining = int(COOLDOWN_SECONDS - elapsed) + 1
+        return False, (
+            f"Her mesaj arasında {COOLDOWN_SECONDS} saniye beklemeniz gerekmektedir. "
+            f"Lütfen {remaining} saniye daha bekleyin."
+        )
+
     return True, ""
+
+
+def register_successful_request(ip: str):
+    """AI'dan başarılı yanıt alındığında çağrılır — cooldown saatini başlatır."""
+    ip_last_success[ip] = time.time()
 
 
 def check_rate_limit_plus(ip):
     now = time.time()
-    log = [t for t in ip_plus_req_log[ip] if now - t < RATE_LIMIT_WINDOW * 10]
+    log = [t for t in ip_plus_req_log[ip] if now - t < 600]
     ip_plus_req_log[ip] = log
     if len(log) >= RATE_LIMIT_MAX_PLUS:
         return False, "Çok fazla başvuru denemesi. Daha sonra tekrar deneyin."
@@ -482,12 +493,10 @@ def check_content(message):
 
 # ========================= VERİTABANI (Firebase) =========================
 def load_requests() -> list:
-    """Firebase'den tüm başvuruları yükle."""
     return firebase_get_all()
 
 
 def add_request(name: str, surname: str, email: str) -> str:
-    """Yeni başvuru ekle, req_id döndür."""
     req_id = str(uuid.uuid4())
     record = {
         "id":        req_id,
@@ -504,7 +513,6 @@ def add_request(name: str, surname: str, email: str) -> str:
 
 
 def update_request_status(req_id: str, status: str) -> bool:
-    """req_id ile kaydı bul ve durumunu güncelle."""
     rec = firebase_find_by_req_id(req_id)
     if not rec:
         return False
@@ -592,6 +600,7 @@ ADMIN_HTML = """
         .search-status{background:#1a2a3a;border:1px solid #00f0ff33;border-radius:8px;padding:8px 14px;font-size:.8rem;color:#60a5fa;margin-bottom:16px;}
         .api-status{background:#1a2a1a;border:1px solid #44ff8833;border-radius:8px;padding:8px 14px;font-size:.8rem;color:#44ff88;margin-bottom:16px;}
         .firebase-status{background:#1a1a2a;border:1px solid #a78bfa33;border-radius:8px;padding:8px 14px;font-size:.8rem;color:#a78bfa;margin-bottom:16px;}
+        .cooldown-info{background:#1a1a2a;border:1px solid #f59e0b44;border-radius:8px;padding:8px 14px;font-size:.8rem;color:#f59e0b;margin-bottom:16px;}
     </style>
 </head>
 <body>
@@ -601,6 +610,7 @@ ADMIN_HTML = """
     <div class="api-status" id="apiStatus">Gemini API durumu kontrol ediliyor...</div>
     <div class="firebase-status" id="firebaseStatus">🔥 Firebase bağlantısı kontrol ediliyor...</div>
     <div class="search-status" id="searchStatus">Google Arama Durumu kontrol ediliyor...</div>
+    <div class="cooldown-info">⏱️ Mesaj Kota Ayarı: Her kullanıcı mesajlar arasında <strong>15 saniye</strong> beklemek zorundadır.</div>
     <div class="stats" id="statsArea"></div>
     <button class="refresh-btn" onclick="fetchRequests()">🔄 Yenile</button>
     <div id="message"></div>
@@ -755,6 +765,7 @@ def index():
         f"Math Canavari API v5.0\n"
         f"Gemini Keys: {len(GEMINI_KEYS)} adet\n"
         f"Google Search: {'OK' if (gk and cx) else 'MISSING'}\n"
+        f"Cooldown: {COOLDOWN_SECONDS} saniye\n"
         f"Firebase: {FIREBASE_URL}",
         status=200, content_type='text/plain; charset=utf-8'
     )
@@ -775,6 +786,7 @@ def health():
         "google_key_set":    gk,
         "google_cx_set":     cx,
         "max_images":        MAX_IMAGES,
+        "cooldown_seconds":  COOLDOWN_SECONDS,
         "firebase_url":      FIREBASE_URL,
     })
 
@@ -805,6 +817,7 @@ def debug_env():
         "GOOGLE_SEARCH_API_KEY_prefix": (gk[:10] + "...") if gk else "YOK",
         "GOOGLE_SEARCH_CX_set":         bool(cx),
         "GOOGLE_SEARCH_CX_value":       cx if cx else "YOK",
+        "cooldown_seconds":             COOLDOWN_SECONDS,
         "firebase_url":                 FIREBASE_URL,
     })
 
@@ -829,6 +842,8 @@ def chat():
         return Response("Hata: Hiçbir Gemini API key yapılandırılmamış!", status=500)
 
     ip = get_client_ip()
+
+    # ★ Rate limit kontrolü (15 saniyelik cooldown)
     allowed, err = check_rate_limit_chat(ip)
     if not allowed:
         return Response(err, status=429)
@@ -838,7 +853,7 @@ def chat():
         user_name    = request.form.get('user_name', '').strip()
         is_plus      = request.form.get('is_plus', 'false').lower() == 'true'
 
-        # ─── ÇOKLU GÖRSEL KONTROLÜ ───
+        # Çoklu görsel kontrolü
         image_files = request.files.getlist('image')
         if not image_files:
             single = request.files.get('image')
@@ -866,7 +881,7 @@ def chat():
             if not ok:
                 return Response(content_err, status=400)
 
-        # ─── GOOGLE ARAŞTIRMASI ───
+        # Google araştırması
         research_context = ""
         search_results   = []
         search_performed = False
@@ -890,7 +905,7 @@ def chat():
                 else:
                     print("[CHAT] Sonuç yok — AI kendi bilgisinden yanıtlar")
 
-        # ─── GÖRSEL İŞLEME ───
+        # Görsel işleme
         parts = []
         for img_file in image_files:
             try:
@@ -915,7 +930,7 @@ def chat():
         if not parts:
             return Response("İçerik işlenemedi!", status=400)
 
-        # ─── AI YANITI ───
+        # AI yanıtı
         system_inst = build_system_instruction(
             user_name=user_name or None,
             is_plus=is_plus,
@@ -931,10 +946,13 @@ def chat():
                 status=503
             )
 
+        # ★ Başarılı yanıt — cooldown saatini başlat
+        register_successful_request(ip)
+
         # AI metninde ayraç varsa temizle
         ai_text_clean = ai_text.replace(SOURCES_SEPARATOR, "").strip()
 
-        # ─── SOURCES PAYLOAD ───
+        # Sources payload
         sources_payload = {
             "performed": search_performed and len(search_results) > 0,
             "query":     search_query,
@@ -1013,6 +1031,8 @@ def analyze_image():
             result_text = generate_with_fallback(parts, None)
         except Exception as e:
             return Response(f"AI servisi meşgul: {str(e)}", status=503)
+        # ★ Vision için de cooldown başlat
+        register_successful_request(ip)
         return Response(result_text, status=200, content_type='text/plain; charset=utf-8')
     except Exception as e:
         print(f"[VISION] HATA: {e}")
@@ -1127,7 +1147,6 @@ def admin_get_requests():
     if request.args.get("token") != "KAYAADMIN":
         return Response("Yetkisiz erişim.", status=401)
     records = load_requests()
-    # _fb_key alanını dışarıya gönderme
     clean = [{k: v for k, v in r.items() if k != '_fb_key'} for r in records]
     return jsonify(clean)
 
@@ -1159,6 +1178,7 @@ if __name__ == "__main__":
     print(f"Google Key:  {'✅' if gk else '❌ YOK'}")
     print(f"Google CX:   {'✅ (' + cx + ')' if cx else '❌ YOK'}")
     print(f"Firebase:    {FIREBASE_URL}")
+    print(f"Cooldown:    {COOLDOWN_SECONDS} saniye (mesajlar arası)")
     print(f"Max Görsel:  {MAX_IMAGES} adet")
     print("=" * 55)
     app.run(host='0.0.0.0', port=port, debug=False)
