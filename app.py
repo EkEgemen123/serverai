@@ -41,22 +41,94 @@ def handle_error(error):
     response.headers['Access-Control-Allow-Origin'] = '*'
     return response
 
-# ========================= GEMİNİ =========================
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '').strip()
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    print("✅ Gemini API yapılandırıldı")
+# ========================= GEMİNİ ÇOKLU API =========================
+# Environment'tan 3 ayrı API key al
+GEMINI_KEYS = []
+for _env_name in ['GEMINI1', 'GEMINI2', 'GEMINI3']:
+    _key = os.environ.get(_env_name, '').strip()
+    if _key:
+        GEMINI_KEYS.append({'name': _env_name, 'key': _key})
+        print(f"✅ {_env_name} yüklendi ({_key[:8]}...)")
+    else:
+        print(f"⚠️  {_env_name} bulunamadı, atlanıyor.")
+
+# Geriye dönük uyumluluk için GEMINI_API_KEY de kontrol et
+if not GEMINI_KEYS:
+    _legacy = os.environ.get('GEMINI_API_KEY', '').strip()
+    if _legacy:
+        GEMINI_KEYS.append({'name': 'GEMINI_API_KEY', 'key': _legacy})
+        print(f"✅ GEMINI_API_KEY (legacy) yüklendi")
+
+if not GEMINI_KEYS:
+    print("❌ HATA: Hiçbir Gemini API key bulunamadı!")
 else:
-    print("❌ HATA: GEMINI_API_KEY bulunamadı!")
+    print(f"✅ Toplam {len(GEMINI_KEYS)} Gemini API key hazır.")
 
 MODEL_NAME        = "gemini-2.5-flash"
 GOOGLE_SEARCH_URL = "https://www.googleapis.com/customsearch/v1"
 
+# ========================= ÇOKLU API İLE GEMİNİ ÇAĞRISI =========================
+def generate_with_fallback(parts, system_instruction):
+    """
+    GEMINI1 → GEMINI2 → GEMINI3 sırasıyla dener.
+    İlk başarılı olan API'nin sonucunu döner.
+    Hepsi başarısız olursa Exception fırlatır.
+    """
+    last_error = None
+    for api_info in GEMINI_KEYS:
+        try:
+            print(f"[GEMINI] {api_info['name']} deneniyor...")
+            genai.configure(api_key=api_info['key'])
+            model  = genai.GenerativeModel(
+                model_name=MODEL_NAME,
+                system_instruction=system_instruction
+            )
+            result = model.generate_content(parts)
+            print(f"[GEMINI] ✅ {api_info['name']} başarılı!")
+            return result.text
+        except Exception as e:
+            last_error = e
+            err_str = str(e).lower()
+            # Kota veya rate limit hatası mı?
+            if any(x in err_str for x in ['quota', 'rate', '429', 'resource exhausted',
+                                           'limit', 'exceeded', 'too many']):
+                print(f"[GEMINI] ⚠️  {api_info['name']} kota/rate limit: {e} — sonraki key deneniyor...")
+                continue
+            # API key geçersiz mi?
+            elif any(x in err_str for x in ['api key', 'invalid', '401', '403',
+                                             'permission', 'unauthorized']):
+                print(f"[GEMINI] ⚠️  {api_info['name']} geçersiz key: {e} — sonraki key deneniyor...")
+                continue
+            # Başka bir hata — yine de devam et
+            else:
+                print(f"[GEMINI] ⚠️  {api_info['name']} hata: {e} — sonraki key deneniyor...")
+                continue
+
+    raise Exception(f"Tüm Gemini API keyleri başarısız oldu. Son hata: {last_error}")
+
+
+def generate_simple(prompt_text):
+    """
+    Sistem talimatı gerektirmeyen basit sorgular için (başlık üretimi vb.)
+    """
+    last_error = None
+    for api_info in GEMINI_KEYS:
+        try:
+            genai.configure(api_key=api_info['key'])
+            model  = genai.GenerativeModel(model_name=MODEL_NAME)
+            result = model.generate_content(prompt_text)
+            return result.text
+        except Exception as e:
+            last_error = e
+            print(f"[GEMINI-SIMPLE] ⚠️  {api_info['name']} hata: {e}")
+            continue
+    raise Exception(f"Tüm Gemini API keyleri başarısız: {last_error}")
+
+
 # ========================= SABİTLER =========================
 MAX_MSG_LENGTH    = 4000
 MAX_IMAGE_SIZE_MB = 10
-
-# Kaynakları body'ye gömmek için ayraç
+MAX_IMAGES        = 2          # ← Tek seferde max 2 görsel
 SOURCES_SEPARATOR = "|||SOURCES|||"
 
 # ========================= ARAŞTIRMA TESPİT =========================
@@ -112,22 +184,11 @@ MATH_ONLY_KEYWORDS = [
 ]
 
 
-def clean_for_header(text: str, max_len: int = 100) -> str:
-    """HTTP header için güvenli string — newline, CR ve non-ASCII kaldır."""
-    cleaned = re.sub(r'[\r\n\t]', ' ', text)
-    cleaned = cleaned.encode('ascii', 'ignore').decode('ascii')
-    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    return cleaned[:max_len]
-
-
-# needs_research() fonksiyonunu şöyle değiştir:
-
 def needs_research(text: str):
     lower = text.lower().strip()
     if len(lower) < 5:
         return False, ""
 
-    # 1. Saf matematik kontrolü
     for pattern in PURE_MATH_PATTERNS:
         if re.match(pattern, lower, re.IGNORECASE):
             return False, ""
@@ -135,7 +196,6 @@ def needs_research(text: str):
         if kw in lower:
             return False, ""
 
-    # 2. Sohbet/selamlaşma
     chat_patterns = [
         r"^(merhaba|selam|nasılsın|naber|iyi\s*günler|iyi\s*akşamlar|günaydın|hey|alo)\s*[!?]?$",
         r"^teşekkür", r"^sağol", r"^ok(ey)?$", r"^tamam$", r"^anladım$",
@@ -145,20 +205,18 @@ def needs_research(text: str):
         if re.search(cp, lower):
             return False, ""
 
-    # 3. Matematik sorusu mu? (Araştırma YAPMA)
     math_question_patterns = [
         r"(türev|integral|limit|matris|determinant|olasılık|permütasyon|kombinasyon)",
         r"(denklem|eşitsizlik|fonksiyon|logaritma|trigonometri|geometri|alan|hacim|çevre)",
-        r"(ispat|kanıtla|göster|bul|hesapla|çöz|sadeleştir|basitleştir|çarpanlarına)",
+        r"(ispat|kanıtla|göster|hesapla|çöz|sadeleştir|basitleştir|çarpanlarına)",
         r"(karekök|mutlak\s*değer|üslü|köklü|kesir|oran|orantı)",
         r"(açı|üçgen|dörtgen|çember|daire|dikdörtgen|kare|paralel|dik)",
         r"^\d+[\+\-\*\/\^]\d+",
-        r"x\s*[\+\-\*\/\^=]\s*\d",  # x içeren denklemler
-        r"f\s*\(",  # f(x) notation
+        r"x\s*[\+\-\*\/\^=]\s*\d",
+        r"f\s*\(",
     ]
     for mp in math_question_patterns:
         if re.search(mp, lower, re.IGNORECASE):
-            # Ama kişi/tarih sorusu değilse
             if not re.search(r"\b(kim|ne\s*zaman|hangi\s*yıl|tarihi|kimdir)\b", lower):
                 return False, ""
 
@@ -170,23 +228,23 @@ def needs_research(text: str):
     ).strip()
     query = re.sub(r'[\r\n]+', ' ', query).strip()
 
-    # 4. Bilinen araştırma şablonları
     for pattern, ptype in RESEARCH_PATTERNS:
         if re.search(pattern, lower, re.IGNORECASE):
             print(f"[RESEARCH DETECT] type='{ptype}' query='{query}'")
             return True, query
 
-    # 5. Genel soru — ama SADECE kişi/tarih/olay içeriyorsa
-    # "ne" tek başına araştırma tetiklememeli!
-    specific_question_words = r"\b(kimdir|kimdi|doğdu|öldü|kuruldu|keşfetti|icat|hangi\s*yıl|ne\s*zaman|tarihi|biyografi)\b"
+    specific_question_words = (
+        r"\b(kimdir|kimdi|doğdu|öldü|kuruldu|keşfetti|icat|"
+        r"hangi\s*yıl|ne\s*zaman|tarihi|biyografi)\b"
+    )
     if re.search(specific_question_words, lower):
         print(f"[RESEARCH DETECT] type='specific_question' query='{query}'")
         return True, query
 
-    # ❌ Artık genel "?" veya "ne" araştırma tetiklemiyor
     return False, ""
 
-def google_search(query: str, num_results: int = 5) -> list[dict]:
+
+def google_search(query: str, num_results: int = 5) -> list:
     api_key = os.environ.get('GOOGLE_SEARCH_API_KEY', '').strip()
     cx      = os.environ.get('GOOGLE_SEARCH_CX', '').strip()
 
@@ -234,9 +292,9 @@ def google_search(query: str, num_results: int = 5) -> list[dict]:
                 domain = urlparse(item.get("link", "")).netloc.replace("www.", "")
             except Exception:
                 domain = ""
-                
-            snippet = item.get("snippet", "")
-            pagemap = item.get("pagemap", {})
+
+            snippet  = item.get("snippet", "")
+            pagemap  = item.get("pagemap", {})
             metatags = pagemap.get("metatags", [])
             if metatags and isinstance(metatags, list) and len(metatags) > 0:
                 og_desc = metatags[0].get("og:description", "")
@@ -263,7 +321,7 @@ def google_search(query: str, num_results: int = 5) -> list[dict]:
         return []
 
 
-def format_search_results_for_ai(results: list[dict], query: str) -> str:
+def format_search_results_for_ai(results: list, query: str) -> str:
     if not results:
         return ""
     lines = [
@@ -281,23 +339,27 @@ def format_search_results_for_ai(results: list[dict], query: str) -> str:
         lines.append("")
     lines.append("---")
     lines.append("LÜTFEN ŞUNLARA DİKKAT ET:")
-    lines.append("1. Bu özetlerdeki verileri GÜNCEL BİLGİ olarak kabul et ve cevabını buna göre oluştur.")
-    lines.append("2. Sadece özetlerdeki kısa cümlelerle yetinme; KENDİ ENGİN BİLGİ BİRİKİMİNİ DE KULLANARAK kullanıcıya kapsamlı, detaylı, profesyonel ve tatmin edici bir yanıt ver.")
-    lines.append("3. Cevabının sonuna '📚 Kaynaklar: [kullandığın kaynakların isimleri]' şeklinde bir ibare ekle.")
+    lines.append("1. Bu özetlerdeki verileri GÜNCEL BİLGİ olarak kabul et.")
+    lines.append("2. KENDİ BİLGİ BİRİKİMİNİ DE KULLANARAK kapsamlı, detaylı bir yanıt ver.")
+    lines.append("3. Cevabının sonuna '📚 Kaynaklar: [kullandığın kaynakların isimleri]' ekle.")
     return "\n".join(lines)
 
 
 # ========================= ZAMAN =========================
 def get_turkey_time_info():
     now_tr    = datetime.now(timezone.utc) + timedelta(hours=3)
-    days_tr   = ["Pazartesi","Salı","Çarşamba","Perşembe","Cuma","Cumartesi","Pazar"]
-    months_tr = ["Ocak","Şubat","Mart","Nisan","Mayıs","Haziran",
-                 "Temmuz","Ağustos","Eylül","Ekim","Kasım","Aralık"]
+    days_tr   = ["Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi", "Pazar"]
+    months_tr = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran",
+                 "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"]
     hour = now_tr.hour
-    if 5 <= hour < 12:    tod = "sabah"
-    elif 12 <= hour < 17: tod = "öğleden sonra"
-    elif 17 <= hour < 21: tod = "akşam"
-    else:                  tod = "gece"
+    if 5 <= hour < 12:
+        tod = "sabah"
+    elif 12 <= hour < 17:
+        tod = "öğleden sonra"
+    elif 17 <= hour < 21:
+        tod = "akşam"
+    else:
+        tod = "gece"
     return {
         "time_str":    now_tr.strftime("%H:%M"),
         "date_str":    f"{now_tr.day} {months_tr[now_tr.month-1]} {now_tr.year}",
@@ -310,7 +372,10 @@ def get_turkey_time_info():
 def build_system_instruction(user_name=None, is_plus=False, research_context=""):
     time_info  = get_turkey_time_info()
     greeting   = f"\nBu kullanıcının adı: {user_name}. Uygun yerlerde '{user_name}' diye seslen." if user_name else ""
-    plus_rules = "\n- Bu kullanıcı Kaya Studios Plus üyesidir. Her konuda yardımcı ol.\n- Daha detaylı ve kapsamlı cevaplar ver." if is_plus else ""
+    plus_rules = (
+        "\n- Bu kullanıcı Kaya Studios Plus üyesidir. Her konuda yardımcı ol."
+        "\n- Daha detaylı ve kapsamlı cevaplar ver."
+    ) if is_plus else ""
 
     research_block = ""
     if research_context:
@@ -331,7 +396,7 @@ KURALLAR:
 - Madde işareti olarak * yerine - kullan.
 - "Google kurdu" veya "Büyük dil modeli" gibi ifadeleri ASLA kullanma.
 - Yalnızca Türkçe konuş (başka dilde sorulursa o dilde cevapla).
-- Kullanıcının sorusunu EN YÜKSEK KALİTEDE, doyurucu ve detaylı bir şekilde yanıtla. Kısa, baştan savma ve robotik cevaplardan kaçın.
+- Kullanıcının sorusunu EN YÜKSEK KALİTEDE, doyurucu ve detaylı bir şekilde yanıtla.
 - Kaya Studios kurucusu Egemen KAYA'dır.
 - Sen Türk bir yapay zekasın.
 {research_block}"""
@@ -389,7 +454,7 @@ def check_rate_limit_plus(ip):
 
 
 def check_spam(ip, message):
-    clean = message.strip().lower()
+    clean  = message.strip().lower()
     recent = ip_last_msgs[ip][-5:]
     if clean and recent.count(clean) >= SPAM_REPEAT_LIMIT:
         return True, "Aynı mesajı tekrar tekrar gönderiyorsunuz."
@@ -426,12 +491,15 @@ def save_requests(reqs):
 
 
 def add_request(name, surname, email):
-    req_id  = str(uuid.uuid4())
-    reqs    = load_requests()
+    req_id = str(uuid.uuid4())
+    reqs   = load_requests()
     reqs.append({
-        "id": req_id, "name": name, "surname": surname, "email": email,
+        "id":        req_id,
+        "name":      name,
+        "surname":   surname,
+        "email":     email,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "status": "pending",
+        "status":    "pending",
     })
     save_requests(reqs)
     return req_id
@@ -516,12 +584,14 @@ ADMIN_HTML = """
         .time-info{font-size:.8rem;color:#9aaec9;margin-bottom:16px;}
         .cancelled-by{font-size:.72rem;color:#888;margin-top:2px;}
         .search-status{background:#1a2a3a;border:1px solid #00f0ff33;border-radius:8px;padding:8px 14px;font-size:.8rem;color:#60a5fa;margin-bottom:16px;}
+        .api-status{background:#1a2a1a;border:1px solid #44ff8833;border-radius:8px;padding:8px 14px;font-size:.8rem;color:#44ff88;margin-bottom:16px;}
     </style>
 </head>
 <body>
 <div class="container">
     <h1>🛡️ Kaya Studios Plus Admin Paneli</h1>
     <div class="time-info" id="timeInfo"></div>
+    <div class="api-status" id="apiStatus">Gemini API durumu kontrol ediliyor...</div>
     <div class="search-status" id="searchStatus">Google Arama Durumu kontrol ediliyor...</div>
     <div class="stats" id="statsArea"></div>
     <button class="refresh-btn" onclick="fetchRequests()">🔄 Yenile</button>
@@ -540,6 +610,14 @@ function updateClock(){
     year:'numeric',month:'long',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'});
 }
 updateClock();setInterval(updateClock,1000);
+async function checkApiStatus(){
+    try{
+        const res=await fetch(`${API_BASE}/health`);
+        const data=await res.json();
+        const el=document.getElementById('apiStatus');
+        el.textContent='🤖 Gemini API: '+data.gemini_keys_count+' key aktif | Model: '+data.model;
+    }catch(e){}
+}
 async function checkSearchStatus(){
     try{
         const res=await fetch(`${API_BASE}/search-status?token=${TOKEN}`);
@@ -547,10 +625,10 @@ async function checkSearchStatus(){
         const el=document.getElementById('searchStatus');
         if(data.configured){
             el.style.borderColor='#44ff8844';el.style.color='#44ff88';
-            el.textContent='✅ Google Custom Search API aktif — Gerçek araştırma çalışıyor';
+            el.textContent='✅ Google Custom Search API aktif';
         }else{
             el.style.borderColor='#ff666644';el.style.color='#ff9999';
-            el.textContent='⚠️ Google API yapılandırılmamış! key='+data.has_api_key+' cx='+data.has_cx;
+            el.textContent='⚠️ Google API yapılandırılmamış!';
         }
     }catch(e){}
 }
@@ -609,7 +687,7 @@ function showMessage(msg,type){
     d.innerHTML=`<div class="${type}">${msg}</div>`;
     setTimeout(()=>d.innerHTML='',3000);
 }
-checkSearchStatus();fetchRequests();setInterval(fetchRequests,30000);
+checkApiStatus();checkSearchStatus();fetchRequests();setInterval(fetchRequests,30000);
 </script>
 </body>
 </html>
@@ -622,7 +700,8 @@ def index():
     gk = bool(os.environ.get('GOOGLE_SEARCH_API_KEY', '').strip())
     cx = bool(os.environ.get('GOOGLE_SEARCH_CX', '').strip())
     return Response(
-        f"Math Canavari API v4.2\nGemini: {'OK' if GEMINI_API_KEY else 'MISSING'}\n"
+        f"Math Canavari API v5.0\n"
+        f"Gemini Keys: {len(GEMINI_KEYS)} adet\n"
         f"Google Search: {'OK' if (gk and cx) else 'MISSING'}",
         status=200, content_type='text/plain; charset=utf-8'
     )
@@ -633,13 +712,16 @@ def health():
     gk = bool(os.environ.get('GOOGLE_SEARCH_API_KEY', '').strip())
     cx = bool(os.environ.get('GOOGLE_SEARCH_CX', '').strip())
     return jsonify({
-        "status":         "OK",
-        "turkey_time":    get_turkey_time_info()["full"],
-        "version":        "4.2",
-        "gemini":         bool(GEMINI_API_KEY),
-        "google_search":  gk and cx,
-        "google_key_set": gk,
-        "google_cx_set":  cx,
+        "status":            "OK",
+        "turkey_time":       get_turkey_time_info()["full"],
+        "version":           "5.0",
+        "gemini_keys_count": len(GEMINI_KEYS),
+        "gemini_keys":       [k['name'] for k in GEMINI_KEYS],
+        "model":             MODEL_NAME,
+        "google_search":     gk and cx,
+        "google_key_set":    gk,
+        "google_cx_set":     cx,
+        "max_images":        MAX_IMAGES,
     })
 
 
@@ -648,12 +730,12 @@ def debug_env():
     gk = os.environ.get('GOOGLE_SEARCH_API_KEY', '')
     cx = os.environ.get('GOOGLE_SEARCH_CX', '')
     return jsonify({
-        "GEMINI_API_KEY_set":           bool(GEMINI_API_KEY),
+        "gemini_keys":                  [k['name'] for k in GEMINI_KEYS],
+        "gemini_keys_count":            len(GEMINI_KEYS),
         "GOOGLE_SEARCH_API_KEY_set":    bool(gk),
         "GOOGLE_SEARCH_API_KEY_prefix": (gk[:10] + "...") if gk else "YOK",
         "GOOGLE_SEARCH_CX_set":         bool(cx),
         "GOOGLE_SEARCH_CX_value":       cx if cx else "YOK",
-        "all_env_keys": [k for k in os.environ.keys() if "GOOGLE" in k or "GEMINI" in k],
     })
 
 
@@ -673,8 +755,8 @@ def search_status():
 
 @app.route("/chat", methods=["POST", "OPTIONS"])
 def chat():
-    if not GEMINI_API_KEY:
-        return Response("Hata: GEMINI_API_KEY yapılandırılmamış!", status=500)
+    if not GEMINI_KEYS:
+        return Response("Hata: Hiçbir Gemini API key yapılandırılmamış!", status=500)
 
     ip = get_client_ip()
     allowed, err = check_rate_limit_chat(ip)
@@ -683,11 +765,26 @@ def chat():
 
     try:
         user_message = request.form.get('message', '').strip()
-        image_file   = request.files.get('image')
         user_name    = request.form.get('user_name', '').strip()
         is_plus      = request.form.get('is_plus', 'false').lower() == 'true'
 
-        if not user_message and not image_file:
+        # ─── ÇOKLU GÖRSEL KONTROLÜ (max 2) ───
+        image_files = request.files.getlist('image')
+        # Eski tekli 'image' field da destekle
+        single_image = request.files.get('image')
+        if single_image and not image_files:
+            image_files = [single_image]
+        # Boş dosyaları filtrele
+        image_files = [f for f in image_files if f and f.filename]
+
+        if len(image_files) > MAX_IMAGES:
+            return Response(
+                f"En fazla {MAX_IMAGES} görsel gönderebilirsiniz. "
+                f"Şu an {len(image_files)} görsel gönderildi.",
+                status=400
+            )
+
+        if not user_message and not image_files:
             return Response("Mesaj veya görsel gerekli!", status=400)
         if user_message and len(user_message) > MAX_MSG_LENGTH:
             return Response(f"Mesaj çok uzun. Maksimum {MAX_MSG_LENGTH} karakter.", status=400)
@@ -701,20 +798,18 @@ def chat():
                 return Response(content_err, status=400)
 
         # ─── GOOGLE ARAŞTIRMASI ───
-        # ─── GOOGLE ARAŞTIRMASI ───
         research_context = ""
         search_results   = []
         search_performed = False
         search_query     = ""
 
-        if user_message and not image_file:
-            # ⭐ Önce ayrı search_query parametresine bak, yoksa user_message'dan çıkar
+        if user_message and not image_files:
             raw_search_query = request.form.get('search_query', '').strip()
             if raw_search_query:
                 do_research, query = needs_research(raw_search_query)
             else:
                 do_research, query = needs_research(user_message)
-            
+
             if do_research:
                 print(f"[CHAT] Araştırma: '{query[:60]}'")
                 search_results   = google_search(query, num_results=5)
@@ -725,55 +820,67 @@ def chat():
                     print(f"[CHAT] {len(search_results)} sonuç AI'a verildi")
                 else:
                     print("[CHAT] Sonuç yok — AI kendi bilgisinden yanıtlar")
+
         # ─── GÖRSEL İŞLEME ───
         parts = []
-        if image_file:
+        for img_file in image_files:
             try:
-                img_data = image_file.read()
+                img_data = img_file.read()
                 if not img_data:
-                    return Response("Resim dosyası boş.", status=400)
+                    return Response(f"Resim dosyası boş: {img_file.filename}", status=400)
                 if len(img_data) / (1024 * 1024) > MAX_IMAGE_SIZE_MB:
-                    return Response(f"Resim çok büyük. Maks {MAX_IMAGE_SIZE_MB}MB.", status=400)
+                    return Response(
+                        f"Resim çok büyük: {img_file.filename}. Maks {MAX_IMAGE_SIZE_MB}MB.",
+                        status=400
+                    )
                 img = Image.open(BytesIO(img_data))
                 img.thumbnail((1024, 1024), Image.LANCZOS)
                 parts.append(img)
+                print(f"[CHAT] Görsel eklendi: {img_file.filename} ({len(img_data)//1024}KB)")
             except Exception as e:
-                print(f"[CHAT] Görsel hatası: {e}")
-                return Response("Resim okunamadı.", status=400)
+                print(f"[CHAT] Görsel hatası ({img_file.filename}): {e}")
+                return Response(f"Resim okunamadı: {img_file.filename}", status=400)
 
         if user_message:
             parts.append(user_message)
         if not parts:
             return Response("İçerik işlenemedi!", status=400)
 
-        # ─── AI YANITI ───
+        # ─── AI YANITI (Çoklu API fallback) ───
         system_inst = build_system_instruction(
             user_name=user_name or None,
             is_plus=is_plus,
             research_context=research_context,
         )
-        model   = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=system_inst)
-        result  = model.generate_content(parts)
-# chat() route'unda, full_response oluşturmadan önce:
 
-# AI'nın kendi ürettiği metinde ayraç varsa temizle
+        try:
+            ai_text = generate_with_fallback(parts, system_inst)
+        except Exception as e:
+            print(f"[CHAT] Tüm Gemini keyleri başarısız: {e}")
+            return Response(
+                "Tüm AI servisleri şu an meşgul. Lütfen birkaç dakika sonra tekrar deneyin.",
+                status=503
+            )
+
+        # AI metninde ayraç varsa temizle
         ai_text_clean = ai_text.replace(SOURCES_SEPARATOR, "").strip()
 
+        # ─── SOURCES PAYLOAD ───
         sources_payload = {
             "performed": search_performed and len(search_results) > 0,
             "query":     search_query,
             "count":     len(search_results),
             "sources": [
-         {
-            "title":  r["title"],
-            "domain": r["domain"],
-            "link":   r["link"],
+                {
+                    "title":  r["title"],
+                    "domain": r["domain"],
+                    "link":   r["link"],
+                }
+                for r in search_results[:5]
+            ],
         }
-        for r in search_results[:5]
-    ],
-}
-sources_json  = json.dumps(sources_payload, ensure_ascii=False, separators=(',', ':'))
-full_response = ai_text_clean + SOURCES_SEPARATOR + sources_json
+        sources_json  = json.dumps(sources_payload, ensure_ascii=False, separators=(',', ':'))
+        full_response = ai_text_clean + SOURCES_SEPARATOR + sources_json
 
         return Response(full_response, status=200, content_type='text/plain; charset=utf-8')
 
@@ -814,29 +921,48 @@ def manual_search():
 
 @app.route("/vision", methods=["POST", "OPTIONS"])
 def analyze_image():
-    if not GEMINI_API_KEY:
-        return Response("Hata: GEMINI_API_KEY yapılandırılmamış!", status=500)
+    if not GEMINI_KEYS:
+        return Response("Hata: Hiçbir Gemini API key yapılandırılmamış!", status=500)
     ip = get_client_ip()
     allowed, err = check_rate_limit_chat(ip)
     if not allowed:
         return Response(err, status=429)
     try:
-        image_file = request.files.get('image')
-        if not image_file:
+        image_files = request.files.getlist('image')
+        if not image_files:
+            single = request.files.get('image')
+            if single:
+                image_files = [single]
+        image_files = [f for f in image_files if f and f.filename]
+
+        if not image_files:
             return Response("Resim dosyası gerekli.", status=400)
+        if len(image_files) > MAX_IMAGES:
+            return Response(f"En fazla {MAX_IMAGES} görsel gönderilebilir.", status=400)
+
         custom_prompt = request.form.get('prompt', '').strip() or (
             "Bu resmi dikkatlice analiz et. Matematik problemi varsa adım adım çöz. Türkçe yanıtla. LaTeX kullan."
         )
-        img_data = image_file.read()
-        if not img_data:
-            return Response("Resim dosyası boş.", status=400)
-        if len(img_data) / (1024 * 1024) > MAX_IMAGE_SIZE_MB:
-            return Response(f"Resim çok büyük. Maks {MAX_IMAGE_SIZE_MB}MB.", status=400)
-        img = Image.open(BytesIO(img_data))
-        img.thumbnail((1024, 1024), Image.LANCZOS)
-        model    = genai.GenerativeModel(model_name=MODEL_NAME)
-        response = model.generate_content([img, custom_prompt])
-        return Response(response.text, status=200, content_type='text/plain; charset=utf-8')
+
+        parts = []
+        for img_file in image_files:
+            img_data = img_file.read()
+            if not img_data:
+                return Response("Resim dosyası boş.", status=400)
+            if len(img_data) / (1024 * 1024) > MAX_IMAGE_SIZE_MB:
+                return Response(f"Resim çok büyük. Maks {MAX_IMAGE_SIZE_MB}MB.", status=400)
+            img = Image.open(BytesIO(img_data))
+            img.thumbnail((1024, 1024), Image.LANCZOS)
+            parts.append(img)
+
+        parts.append(custom_prompt)
+
+        try:
+            result_text = generate_with_fallback(parts, None)
+        except Exception as e:
+            return Response(f"AI servisi meşgul: {str(e)}", status=503)
+
+        return Response(result_text, status=200, content_type='text/plain; charset=utf-8')
     except Exception as e:
         print(f"[VISION] HATA: {e}")
         traceback.print_exc()
@@ -865,7 +991,9 @@ def kaya_plus_request():
         return Response("Geçersiz Gmail formatı.", status=400)
     already, status = email_already_applied(email)
     if already:
-        msg = "Bu email ile zaten onaylanmış bir üyelik var." if status == "approved" else "Bu email ile bekleyen bir başvurunuz var."
+        msg = ("Bu email ile zaten onaylanmış bir üyelik var."
+               if status == "approved"
+               else "Bu email ile bekleyen bir başvurunuz var.")
         return Response(msg, status=409)
     req_id = add_request(name, surname, email)
     return jsonify({"message": "Başvuru alındı.", "req_id": req_id}), 200
@@ -966,12 +1094,13 @@ def admin_update_request(req_id):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print("=" * 50)
-    print(f"Math Canavari API v4.2 — Port {port}")
-    print(f"Gemini:     {'✅' if GEMINI_API_KEY else '❌ YOK'}")
+    print("=" * 55)
+    print(f"Math Canavari API v5.0 — Port {port}")
+    print(f"Gemini Keys: {len(GEMINI_KEYS)} adet → {[k['name'] for k in GEMINI_KEYS]}")
     gk = os.environ.get('GOOGLE_SEARCH_API_KEY', '').strip()
     cx = os.environ.get('GOOGLE_SEARCH_CX', '').strip()
-    print(f"Google Key: {'✅ (' + gk[:8] + '...)' if gk else '❌ YOK'}")
+    print(f"Google Key: {'✅' if gk else '❌ YOK'}")
     print(f"Google CX:  {'✅ (' + cx + ')' if cx else '❌ YOK'}")
-    print("=" * 50)
+    print(f"Max Görsel: {MAX_IMAGES} adet")
+    print("=" * 55)
     app.run(host='0.0.0.0', port=port, debug=False)
