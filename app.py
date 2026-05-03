@@ -41,6 +41,10 @@ def handle_error(error):
     response.headers['Access-Control-Allow-Origin'] = '*'
     return response
 
+@app.route("/favicon.ico")
+def favicon():
+    return Response(status=204)
+
 # ========================= GEMİNİ ÇOKLU API =========================
 GEMINI_KEYS = []
 for _env_name in ['GEMINI1', 'GEMINI2', 'GEMINI3']:
@@ -62,11 +66,11 @@ if not GEMINI_KEYS:
 else:
     print(f"✅ Toplam {len(GEMINI_KEYS)} Gemini API key hazır.")
 
-MODEL_NAME        = "gemini-2.5-flash"
-GOOGLE_SEARCH_URL = "https://www.googleapis.com/customsearch/v1"
+MODEL_NAME   = "gemini-2.5-flash"
+SERP_API_URL = "https://serpapi.com/search.json"
 
 # ========================= FİREBASE REALTIME DATABASE =========================
-FIREBASE_URL = "https://kayastudiosai-1dfb1-default-rtdb.firebaseio.com"
+FIREBASE_URL           = "https://kayastudiosai-1dfb1-default-rtdb.firebaseio.com"
 FIREBASE_REQUESTS_PATH = f"{FIREBASE_URL}/kaya_plus_requests.json"
 
 def firebase_get_all() -> list:
@@ -144,7 +148,7 @@ def generate_with_fallback(parts, system_instruction):
             return result.text
         except Exception as e:
             last_error = e
-            err_str = str(e).lower()
+            err_str    = str(e).lower()
             if any(x in err_str for x in ['quota', 'rate', '429', 'resource exhausted', 'limit', 'exceeded', 'too many']):
                 print(f"[GEMINI] ⚠️  {api_info['name']} kota/rate limit — sonraki deneniyor...")
                 continue
@@ -268,67 +272,174 @@ def needs_research(text: str):
     return False, ""
 
 
-def google_search(query: str, num_results: int = 5) -> list:
-    api_key = os.environ.get('GOOGLE_SEARCH_API_KEY', '').strip()
-    cx      = os.environ.get('GOOGLE_SEARCH_CX', '').strip()
-    print(f"[GOOGLE] key={'VAR(' + api_key[:8] + '...)' if api_key else 'YOK'} cx='{cx}' q='{query[:60]}'")
+# ========================= SERP API ARAMA =========================
+def serp_search(query: str, num_results: int = 5) -> list:
+    """
+    SerpAPI ile Google arama yapar.
+    Organik sonuçları, knowledge graph ve answer box dahil en kaliteli
+    verileri çeker ve temiz bir liste döndürür.
+    """
+    api_key = os.environ.get('SERP_API_KEY', '').strip()
+    print(f"[SERP] key={'VAR(' + api_key[:8] + '...)' if api_key else 'YOK'} q='{query[:60]}'")
+
     if not api_key:
-        print("[GOOGLE] ❌ API KEY eksik!")
+        print("[SERP] ❌ SERP_API_KEY eksik!")
         return []
-    if not cx:
-        print("[GOOGLE] ❌ CX eksik!")
-        return []
+
     try:
         params = {
-            "key": api_key, "cx": cx, "q": query,
-            "num": min(num_results, 10), "lr": "lang_tr", "hl": "tr",
+            "engine":   "google",
+            "q":        query,
+            "api_key":  api_key,
+            "num":      min(num_results + 3, 10),
+            "hl":       "tr",
+            "gl":       "tr",
+            "safe":     "active",
         }
-        resp = http_requests.get(GOOGLE_SEARCH_URL, params=params, timeout=10)
-        print(f"[GOOGLE] HTTP {resp.status_code}")
-        print(f"[GOOGLE] RAW RESPONSE: {resp.text[:2000]}")
-        if resp.status_code == 400:
-            print(f"[GOOGLE] 400: {resp.text[:300]}")
-            return []
-        if resp.status_code == 403:
-            print(f"[GOOGLE] 403: {resp.text[:200]}")
+        resp = http_requests.get(SERP_API_URL, params=params, timeout=15)
+        print(f"[SERP] HTTP {resp.status_code}")
+
+        if resp.status_code == 401:
+            print("[SERP] ❌ Geçersiz API key!")
             return []
         if resp.status_code == 429:
-            print("[GOOGLE] 429 - Kota aşıldı")
+            print("[SERP] ⚠️ Kota aşıldı!")
             return []
         if resp.status_code != 200:
-            print(f"[GOOGLE] Hata {resp.status_code}: {resp.text[:200]}")
+            print(f"[SERP] Hata {resp.status_code}: {resp.text[:300]}")
             return []
-        data  = resp.json()
-        items = data.get("items", [])
-        print(f"[GOOGLE] ✅ {len(items)} sonuç")
+
+        data    = resp.json()
         results = []
-        for item in items:
+
+        # ── 1. Knowledge Graph (en kaliteli bilgi) ──
+        kg = data.get("knowledge_graph", {})
+        if kg:
+            title       = kg.get("title", "")
+            description = kg.get("description", "")
+            kg_type     = kg.get("type", "")
+            source      = kg.get("source", {})
+            link        = source.get("link", "https://www.google.com/search?q=" + query)
+
+            # Knowledge graph'tan ekstra alanları topla
+            extra_fields = []
+            skip_keys = {"title", "type", "description", "source", "image",
+                         "thumbnail", "header_images", "images", "website",
+                         "profiles", "people_also_search_for", "see_results_about"}
+            for k, v in kg.items():
+                if k not in skip_keys and isinstance(v, str) and len(v) < 200:
+                    label = k.replace("_", " ").title()
+                    extra_fields.append(f"{label}: {v}")
+
+            snippet = description
+            if extra_fields:
+                snippet += " | " + " | ".join(extra_fields[:6])
+
+            if title:
+                results.append({
+                    "title":   f"📊 {title}" + (f" — {kg_type}" if kg_type else ""),
+                    "link":    link,
+                    "snippet": snippet[:700],
+                    "domain":  "knowledge.google.com",
+                    "source":  "knowledge_graph",
+                })
+                print(f"[SERP] ✅ Knowledge Graph: {title}")
+
+        # ── 2. Answer Box (direkt cevap kutusu) ──
+        ab = data.get("answer_box", {})
+        if ab:
+            ab_type   = ab.get("type", "")
+            ab_answer = (
+                ab.get("answer") or
+                ab.get("snippet") or
+                ab.get("result") or
+                ab.get("contents") or ""
+            )
+            ab_title  = ab.get("title", "Direkt Cevap")
+            ab_link   = ab.get("link", "")
+
+            if ab_answer:
+                results.append({
+                    "title":   f"💡 {ab_title}",
+                    "link":    ab_link or "https://www.google.com/search?q=" + query,
+                    "snippet": str(ab_answer)[:600],
+                    "domain":  urlparse(ab_link).netloc.replace("www.", "") if ab_link else "google.com",
+                    "source":  "answer_box",
+                })
+                print(f"[SERP] ✅ Answer Box: {ab_title}")
+
+        # ── 3. Organik sonuçlar ──
+        organic = data.get("organic_results", [])
+        print(f"[SERP] Organik sonuç: {len(organic)} adet")
+
+        for item in organic:
+            if len(results) >= num_results + 2:
+                break
             try:
-                domain = urlparse(item.get("link", "")).netloc.replace("www.", "")
-            except Exception:
-                domain = ""
-            snippet  = item.get("snippet", "")
-            pagemap  = item.get("pagemap", {})
-            metatags = pagemap.get("metatags", [])
-            if metatags and isinstance(metatags, list) and len(metatags) > 0:
-                og_desc = metatags[0].get("og:description", "")
-                if og_desc and len(og_desc) > len(snippet):
-                    snippet = og_desc
-            results.append({
-                "title":   item.get("title", "")[:150],
-                "link":    item.get("link", ""),
-                "snippet": snippet[:600].replace('\n', ' '),
-                "domain":  domain,
-            })
+                link   = item.get("link", "")
+                domain = urlparse(link).netloc.replace("www.", "")
+                title  = item.get("title", "")
+
+                # En kaliteli snippet'i seç
+                snippet = item.get("snippet", "")
+
+                # Rich snippet varsa ekle
+                rich = item.get("rich_snippet", {})
+                if rich:
+                    top  = rich.get("top", {})
+                    bot  = rich.get("bottom", {})
+                    ext  = top.get("extensions", []) + bot.get("extensions", [])
+                    if ext:
+                        snippet += " | " + " | ".join(ext[:4])
+
+                # Sitelinks varsa ekle
+                sitelinks = item.get("sitelinks", {})
+                if isinstance(sitelinks, dict):
+                    inline = sitelinks.get("inline", [])
+                    if inline:
+                        sl_titles = [sl.get("title", "") for sl in inline[:3]]
+                        snippet  += " | Alt konular: " + ", ".join(sl_titles)
+
+                results.append({
+                    "title":   title[:150],
+                    "link":    link,
+                    "snippet": snippet[:600].replace('\n', ' '),
+                    "domain":  domain,
+                    "source":  "organic",
+                })
+            except Exception as e:
+                print(f"[SERP] Sonuç parse hatası: {e}")
+                continue
+
+        # ── 4. Related Questions (PAA) ──
+        paa = data.get("related_questions", [])
+        if paa and len(results) < num_results:
+            for q_item in paa[:2]:
+                q_text   = q_item.get("question", "")
+                q_answer = q_item.get("snippet", "") or q_item.get("answer", "")
+                q_link   = q_item.get("link", "")
+                if q_text and q_answer:
+                    results.append({
+                        "title":   f"❓ {q_text}",
+                        "link":    q_link or "https://www.google.com/search?q=" + query,
+                        "snippet": q_answer[:400],
+                        "domain":  urlparse(q_link).netloc.replace("www.", "") if q_link else "google.com",
+                        "source":  "related_questions",
+                    })
+
+        # Sonuçları num_results ile sınırla
+        results = results[:num_results]
+        print(f"[SERP] ✅ Toplam {len(results)} kaliteli sonuç döndürülüyor")
         return results
+
     except http_requests.exceptions.Timeout:
-        print("[GOOGLE] ⏱ Timeout!")
+        print("[SERP] ⏱ Timeout!")
         return []
     except http_requests.exceptions.ConnectionError:
-        print("[GOOGLE] 🔌 Bağlantı hatası!")
+        print("[SERP] 🔌 Bağlantı hatası!")
         return []
     except Exception as e:
-        print(f"[GOOGLE] Hata: {e}")
+        print(f"[SERP] Hata: {e}")
         traceback.print_exc()
         return []
 
@@ -336,22 +447,35 @@ def google_search(query: str, num_results: int = 5) -> list:
 def format_search_results_for_ai(results: list, query: str) -> str:
     if not results:
         return ""
+
+    source_labels = {
+        "knowledge_graph":   "📊 Knowledge Graph",
+        "answer_box":        "💡 Direkt Cevap",
+        "organic":           "🌐 Web Sonucu",
+        "related_questions": "❓ İlgili Soru",
+    }
+
     lines = [
-        f"## Google Araştırma Sonuçları ({len(results)} kaynak)",
-        f"Arama: {query}", "",
-        "Aşağıdaki güncel Google arama sonuçları, senin bilgini güncellemek ve desteklemek içindir:", "",
+        f"## SerpAPI Google Araştırma Sonuçları ({len(results)} kaynak)",
+        f"Arama sorgusu: {query}", "",
+        "Aşağıdaki güncel ve kaliteli Google arama sonuçları senin için toplanmıştır:", "",
     ]
     for i, r in enumerate(results, 1):
-        lines.append(f"**Kaynak {i}: {r['title']}**")
+        src_label = source_labels.get(r.get("source", "organic"), "🌐 Web Sonucu")
+        lines.append(f"**Kaynak {i} [{src_label}]: {r['title']}**")
         lines.append(f"  URL: {r['link']}")
         if r.get("snippet"):
-            lines.append(f"  Özet: {r['snippet']}")
+            lines.append(f"  İçerik: {r['snippet']}")
         lines.append("")
-    lines.append("---")
-    lines.append("LÜTFEN ŞUNLARA DİKKAT ET:")
-    lines.append("1. Bu özetlerdeki verileri GÜNCEL BİLGİ olarak kabul et.")
-    lines.append("2. KENDİ BİLGİ BİRİKİMİNİ DE KULLANARAK kapsamlı, detaylı bir yanıt ver.")
-    lines.append("3. Cevabının sonuna '📚 Kaynaklar: [kullandığın kaynakların isimleri]' ekle.")
+
+    lines += [
+        "---",
+        "TALİMATLAR:",
+        "1. Yukarıdaki bilgileri GÜNCEL VE DOĞRU kaynak olarak kabul et.",
+        "2. Knowledge Graph ve Answer Box sonuçlarına öncelik ver.",
+        "3. Kendi bilginle birleştirerek kapsamlı ve akıcı bir yanıt yaz.",
+        "4. Yanıtın sonunda '📚 Kaynaklar: [kullandığın kaynaklar]' ekle.",
+    ]
     return "\n".join(lines)
 
 
@@ -387,7 +511,7 @@ def build_system_instruction(user_name=None, is_plus=False, research_context="")
         research_block = f"""
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-GÜNCEL GOOGLE ARAŞTIRMA SONUÇLARI
+GÜNCEL SERP API ARAŞTIRMA SONUÇLARI
 {research_context}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
@@ -407,15 +531,13 @@ KURALLAR:
 
 
 # ========================= RATE LİMİTİNG =========================
-# ★ Her IP'nin son başarılı mesaj zamanını tut
-ip_last_request  = defaultdict(float)   # son istek zamanı (flood kontrolü)
-ip_last_success  = defaultdict(float)   # son BAŞARILI chat zamanı (15 sn kota)
-ip_plus_req_log  = defaultdict(list)
-ip_last_msgs     = defaultdict(list)
+ip_last_request = defaultdict(float)
+ip_last_success = defaultdict(float)
+ip_plus_req_log = defaultdict(list)
+ip_last_msgs    = defaultdict(list)
 
-# ★ Kota ayarları
-COOLDOWN_SECONDS  = 15          # mesajlar arası zorunlu bekleme süresi
-MIN_MSG_INTERVAL  = 0.5         # flood koruması (çok hızlı art arda istek)
+COOLDOWN_SECONDS    = 15
+MIN_MSG_INTERVAL    = 0.5
 RATE_LIMIT_MAX_PLUS = 3
 SPAM_REPEAT_LIMIT   = 3
 
@@ -434,19 +556,12 @@ def get_client_ip():
 
 
 def check_rate_limit_chat(ip: str):
-    """
-    Her mesajlar arası en az COOLDOWN_SECONDS (15 sn) beklenmesi zorunlu.
-    Kaç saniye kaldığını da mesaja ekle.
-    """
-    now = time.time()
-
-    # Flood koruması: aynı IP'den çok hızlı art arda istek (0.5 sn)
+    now  = time.time()
     last = ip_last_request[ip]
     if now - last < MIN_MSG_INTERVAL:
         return False, "Çok hızlı istek. Lütfen bir an bekleyin."
     ip_last_request[ip] = now
 
-    # ★ 15 saniyelik cooldown kontrolü
     last_success = ip_last_success[ip]
     elapsed      = now - last_success
     if last_success > 0 and elapsed < COOLDOWN_SECONDS:
@@ -455,12 +570,10 @@ def check_rate_limit_chat(ip: str):
             f"Her mesaj arasında {COOLDOWN_SECONDS} saniye beklemeniz gerekmektedir. "
             f"Lütfen {remaining} saniye daha bekleyin."
         )
-
     return True, ""
 
 
 def register_successful_request(ip: str):
-    """AI'dan başarılı yanıt alındığında çağrılır — cooldown saatini başlatır."""
     ip_last_success[ip] = time.time()
 
 
@@ -598,33 +711,26 @@ ADMIN_HTML = """
         .refresh-btn{background:#00f0ff;color:#0a0c10;margin-bottom:16px;padding:8px 20px;border-radius:20px;font-weight:bold;border:none;cursor:pointer;}
         .time-info{font-size:.8rem;color:#9aaec9;margin-bottom:16px;}
         .cancelled-by{font-size:.72rem;color:#888;margin-top:2px;}
-        .search-status{background:#1a2a3a;border:1px solid #00f0ff33;border-radius:8px;padding:8px 14px;font-size:.8rem;color:#60a5fa;margin-bottom:16px;}
-        .api-status{background:#1a2a1a;border:1px solid #44ff8833;border-radius:8px;padding:8px 14px;font-size:.8rem;color:#44ff88;margin-bottom:16px;}
-        .firebase-status{background:#1a1a2a;border:1px solid #a78bfa33;border-radius:8px;padding:8px 14px;font-size:.8rem;color:#a78bfa;margin-bottom:16px;}
-        .cooldown-info{background:#1a1a2a;border:1px solid #f59e0b44;border-radius:8px;padding:8px 14px;font-size:.8rem;color:#f59e0b;margin-bottom:16px;}
+        .info-box{border-radius:8px;padding:8px 14px;font-size:.8rem;margin-bottom:12px;}
+        .serp-status{background:#1a2a1a;border:1px solid #44ff8833;color:#44ff88;}
+        .firebase-status{background:#1a1a2a;border:1px solid #a78bfa33;color:#a78bfa;}
+        .cooldown-info{background:#1a1a2a;border:1px solid #f59e0b44;color:#f59e0b;}
+        .api-status{background:#1a2a3a;border:1px solid #00f0ff33;color:#60a5fa;}
     </style>
 </head>
 <body>
 <div class="container">
     <h1>🛡️ Kaya Studios Plus Admin Paneli</h1>
     <div class="time-info" id="timeInfo"></div>
-    <div class="api-status" id="apiStatus">Gemini API durumu kontrol ediliyor...</div>
-    <div class="firebase-status" id="firebaseStatus">🔥 Firebase bağlantısı kontrol ediliyor...</div>
-    <div class="search-status" id="searchStatus">Google Arama Durumu kontrol ediliyor...</div>
-    <div class="cooldown-info">⏱️ Mesaj Kota Ayarı: Her kullanıcı mesajlar arasında <strong>15 saniye</strong> beklemek zorundadır.</div>
+    <div class="info-box api-status"    id="apiStatus">🤖 Gemini API kontrol ediliyor...</div>
+    <div class="info-box firebase-status" id="firebaseStatus">🔥 Firebase kontrol ediliyor...</div>
+    <div class="info-box serp-status"   id="serpStatus">🔍 SerpAPI kontrol ediliyor...</div>
+    <div class="info-box cooldown-info">⏱️ Mesaj Kota: Her kullanıcı mesajlar arasında <strong>15 saniye</strong> bekler.</div>
     <div class="stats" id="statsArea"></div>
     <button class="refresh-btn" onclick="fetchRequests()">🔄 Yenile</button>
     <div id="message"></div>
     <table id="requestsTable">
-        <thead>
-            <tr>
-                <th>Ad Soyad</th>
-                <th>Email</th>
-                <th>Başvuru Tarihi</th>
-                <th>Durum</th>
-                <th>İşlem</th>
-            </tr>
-        </thead>
+        <thead><tr><th>Ad Soyad</th><th>Email</th><th>Başvuru Tarihi</th><th>Durum</th><th>İşlem</th></tr></thead>
         <tbody></tbody>
     </table>
 </div>
@@ -634,11 +740,7 @@ const TOKEN    = new URLSearchParams(window.location.search).get('token');
 
 function updateClock() {
     document.getElementById('timeInfo').textContent = 'Türkiye Saati: ' +
-        new Date().toLocaleString('tr-TR', {
-            timeZone:'Europe/Istanbul', weekday:'long',
-            year:'numeric', month:'long', day:'numeric',
-            hour:'2-digit', minute:'2-digit', second:'2-digit'
-        });
+        new Date().toLocaleString('tr-TR', {timeZone:'Europe/Istanbul',weekday:'long',year:'numeric',month:'long',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'});
 }
 updateClock(); setInterval(updateClock, 1000);
 
@@ -646,38 +748,25 @@ async function checkApiStatus() {
     try {
         const res  = await fetch(`${API_BASE}/health`);
         const data = await res.json();
-        const el   = document.getElementById('apiStatus');
-        el.textContent = '🤖 Gemini API: ' + data.gemini_keys_count + ' key aktif | Model: ' + data.model;
+        document.getElementById('apiStatus').textContent =
+            `🤖 Gemini: ${data.gemini_keys_count} key | Model: ${data.model} | Cooldown: ${data.cooldown_seconds}s`;
+        document.getElementById('serpStatus').textContent =
+            data.serp_configured
+                ? `✅ SerpAPI aktif — Arama motoru hazır`
+                : `⚠️ SerpAPI yapılandırılmamış! SERP_API_KEY eksik.`;
+        document.getElementById('serpStatus').style.color = data.serp_configured ? '#44ff88' : '#ff9999';
     } catch(e) {}
 }
 
 async function checkFirebaseStatus() {
     try {
-        const res = await fetch(`${API_BASE}/firebase-status?token=${TOKEN}`);
+        const res  = await fetch(`${API_BASE}/firebase-status?token=${TOKEN}`);
         const data = await res.json();
         const el   = document.getElementById('firebaseStatus');
-        if (data.connected) {
-            el.style.borderColor = '#44ff8844'; el.style.color = '#44ff88';
-            el.textContent = '🔥 Firebase Realtime Database bağlı — ' + data.record_count + ' kayıt';
-        } else {
-            el.style.borderColor = '#ff666644'; el.style.color = '#ff9999';
-            el.textContent = '⚠️ Firebase bağlantı hatası!';
-        }
-    } catch(e) {}
-}
-
-async function checkSearchStatus() {
-    try {
-        const res  = await fetch(`${API_BASE}/search-status?token=${TOKEN}`);
-        const data = await res.json();
-        const el   = document.getElementById('searchStatus');
-        if (data.configured) {
-            el.style.borderColor = '#44ff8844'; el.style.color = '#44ff88';
-            el.textContent = '✅ Google Custom Search API aktif';
-        } else {
-            el.style.borderColor = '#ff666644'; el.style.color = '#ff9999';
-            el.textContent = '⚠️ Google API yapılandırılmamış!';
-        }
+        el.textContent = data.connected
+            ? `🔥 Firebase bağlı — ${data.record_count} kayıt`
+            : `⚠️ Firebase bağlantı hatası!`;
+        el.style.color = data.connected ? '#a78bfa' : '#ff9999';
     } catch(e) {}
 }
 
@@ -689,11 +778,10 @@ async function fetchRequests() {
 }
 
 function renderStats(r) {
-    const t  = r.length;
-    const p  = r.filter(x => x.status === 'pending').length;
-    const a  = r.filter(x => x.status === 'approved').length;
-    const rj = r.filter(x => x.status === 'rejected').length;
-    const c  = r.filter(x => x.status === 'cancelled').length;
+    const t=r.length, p=r.filter(x=>x.status==='pending').length,
+          a=r.filter(x=>x.status==='approved').length,
+          rj=r.filter(x=>x.status==='rejected').length,
+          c=r.filter(x=>x.status==='cancelled').length;
     document.getElementById('statsArea').innerHTML =
         `<div class="stat-card"><div class="num">${t}</div><div class="lbl">Toplam</div></div>
          <div class="stat-card"><div class="num" style="color:#ffaa44">${p}</div><div class="lbl">Bekliyor</div></div>
@@ -705,51 +793,47 @@ function renderStats(r) {
 function renderTable(requests) {
     const tbody = document.querySelector('#requestsTable tbody');
     tbody.innerHTML = '';
-    [...requests].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)).forEach(req => {
+    [...requests].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)).forEach(req => {
         const row = tbody.insertRow();
         row.insertCell(0).textContent = `${req.name} ${req.surname}`;
         row.insertCell(1).textContent = req.email;
-        row.insertCell(2).textContent = new Date(req.timestamp).toLocaleString('tr-TR', {timeZone:'Europe/Istanbul'});
-        const labels = {pending:'Bekliyor', approved:'Onaylandı', rejected:'Reddedildi', cancelled:'İptal Edildi'};
+        row.insertCell(2).textContent = new Date(req.timestamp).toLocaleString('tr-TR',{timeZone:'Europe/Istanbul'});
+        const labels = {pending:'Bekliyor',approved:'Onaylandı',rejected:'Reddedildi',cancelled:'İptal Edildi'};
         const sc = row.insertCell(3);
-        let sh = `<span class="status-${req.status}">${labels[req.status] || req.status}</span>`;
-        if (req.status === 'cancelled' && req.cancelled_by)
-            sh += `<div class="cancelled-by">${req.cancelled_by === 'user' ? '👤 Kullanıcı' : '🛡️ Admin'} iptal etti</div>`;
+        let sh = `<span class="status-${req.status}">${labels[req.status]||req.status}</span>`;
+        if (req.status==='cancelled'&&req.cancelled_by)
+            sh += `<div class="cancelled-by">${req.cancelled_by==='user'?'👤 Kullanıcı':'🛡️ Admin'} iptal etti</div>`;
         sc.innerHTML = sh;
         const ac = row.insertCell(4);
-        if (req.status === 'pending')
+        if (req.status==='pending')
             ac.innerHTML = `<button class="approve" onclick="updateStatus('${req.id}','approved')">✅ Onayla</button>
                             <button class="reject"  onclick="updateStatus('${req.id}','rejected')">❌ Reddet</button>`;
-        else if (req.status === 'approved')
+        else if (req.status==='approved')
             ac.innerHTML = `<button class="cancel-btn" onclick="adminCancel('${req.id}')">🚫 İptal Et</button>`;
-        else
-            ac.innerHTML = '<span style="color:#555">—</span>';
+        else ac.innerHTML = '<span style="color:#555">—</span>';
     });
 }
 
-async function updateStatus(id, s) {
-    const res = await fetch(`${API_BASE}/admin/request/${id}?token=${TOKEN}&status=${s}`, {method:'POST'});
-    showMessage(res.ok ? 'Durum güncellendi.' : 'Hata', res.ok ? 'success' : 'error');
-    if (res.ok) fetchRequests();
+async function updateStatus(id,s) {
+    const res = await fetch(`${API_BASE}/admin/request/${id}?token=${TOKEN}&status=${s}`,{method:'POST'});
+    showMessage(res.ok?'Durum güncellendi.':'Hata', res.ok?'success':'error');
+    if(res.ok) fetchRequests();
 }
 
 async function adminCancel(id) {
-    if (!confirm('Üyeliği iptal etmek istediğinizden emin misiniz?')) return;
-    const res = await fetch(`${API_BASE}/admin/cancel/${id}?token=${TOKEN}`, {method:'POST'});
-    showMessage(res.ok ? 'İptal edildi.' : `Hata: ${await res.text()}`, res.ok ? 'success' : 'error');
-    if (res.ok) fetchRequests();
+    if(!confirm('Üyeliği iptal etmek istediğinizden emin misiniz?')) return;
+    const res = await fetch(`${API_BASE}/admin/cancel/${id}?token=${TOKEN}`,{method:'POST'});
+    showMessage(res.ok?'İptal edildi.':`Hata: ${await res.text()}`, res.ok?'success':'error');
+    if(res.ok) fetchRequests();
 }
 
-function showMessage(msg, type) {
+function showMessage(msg,type) {
     const d = document.getElementById('message');
     d.innerHTML = `<div class="${type}">${msg}</div>`;
-    setTimeout(() => d.innerHTML = '', 3000);
+    setTimeout(()=>d.innerHTML='',3000);
 }
 
-checkApiStatus();
-checkFirebaseStatus();
-checkSearchStatus();
-fetchRequests();
+checkApiStatus(); checkFirebaseStatus(); fetchRequests();
 setInterval(fetchRequests, 30000);
 </script>
 </body>
@@ -760,12 +844,11 @@ setInterval(fetchRequests, 30000);
 # ========================= ROUTES =========================
 @app.route("/", methods=["GET"])
 def index():
-    gk = bool(os.environ.get('GOOGLE_SEARCH_API_KEY', '').strip())
-    cx = bool(os.environ.get('GOOGLE_SEARCH_CX', '').strip())
+    serp_ok = bool(os.environ.get('SERP_API_KEY', '').strip())
     return Response(
         f"Math Canavari API v5.0\n"
         f"Gemini Keys: {len(GEMINI_KEYS)} adet\n"
-        f"Google Search: {'OK' if (gk and cx) else 'MISSING'}\n"
+        f"SerpAPI: {'OK' if serp_ok else 'MISSING — SERP_API_KEY ekleyin'}\n"
         f"Cooldown: {COOLDOWN_SECONDS} saniye\n"
         f"Firebase: {FIREBASE_URL}",
         status=200, content_type='text/plain; charset=utf-8'
@@ -774,8 +857,7 @@ def index():
 
 @app.route("/health", methods=["GET"])
 def health():
-    gk = bool(os.environ.get('GOOGLE_SEARCH_API_KEY', '').strip())
-    cx = bool(os.environ.get('GOOGLE_SEARCH_CX', '').strip())
+    serp_ok = bool(os.environ.get('SERP_API_KEY', '').strip())
     return jsonify({
         "status":            "OK",
         "turkey_time":       get_turkey_time_info()["full"],
@@ -783,9 +865,7 @@ def health():
         "gemini_keys_count": len(GEMINI_KEYS),
         "gemini_keys":       [k['name'] for k in GEMINI_KEYS],
         "model":             MODEL_NAME,
-        "google_search":     gk and cx,
-        "google_key_set":    gk,
-        "google_cx_set":     cx,
+        "serp_configured":   serp_ok,
         "max_images":        MAX_IMAGES,
         "cooldown_seconds":  COOLDOWN_SECONDS,
         "firebase_url":      FIREBASE_URL,
@@ -798,42 +878,21 @@ def firebase_status():
         return Response("Yetkisiz erişim", status=401)
     try:
         records = firebase_get_all()
-        return jsonify({
-            "connected":    True,
-            "record_count": len(records),
-            "firebase_url": FIREBASE_URL,
-        })
+        return jsonify({"connected": True, "record_count": len(records), "firebase_url": FIREBASE_URL})
     except Exception as e:
         return jsonify({"connected": False, "error": str(e)})
 
 
 @app.route("/debug-env", methods=["GET"])
 def debug_env():
-    gk = os.environ.get('GOOGLE_SEARCH_API_KEY', '')
-    cx = os.environ.get('GOOGLE_SEARCH_CX', '')
+    serp = os.environ.get('SERP_API_KEY', '')
     return jsonify({
-        "gemini_keys":                  [k['name'] for k in GEMINI_KEYS],
-        "gemini_keys_count":            len(GEMINI_KEYS),
-        "GOOGLE_SEARCH_API_KEY_set":    bool(gk),
-        "GOOGLE_SEARCH_API_KEY_prefix": (gk[:10] + "...") if gk else "YOK",
-        "GOOGLE_SEARCH_CX_set":         bool(cx),
-        "GOOGLE_SEARCH_CX_value":       cx if cx else "YOK",
-        "cooldown_seconds":             COOLDOWN_SECONDS,
-        "firebase_url":                 FIREBASE_URL,
-    })
-
-
-@app.route("/search-status", methods=["GET"])
-def search_status():
-    if request.args.get("token") != "KAYAADMIN":
-        return Response("Yetkisiz erişim", status=401)
-    gk = os.environ.get('GOOGLE_SEARCH_API_KEY', '').strip()
-    cx = os.environ.get('GOOGLE_SEARCH_CX', '').strip()
-    return jsonify({
-        "configured":  bool(gk and cx),
-        "has_api_key": bool(gk),
-        "has_cx":      bool(cx),
-        "cx_value":    cx or "YOK",
+        "gemini_keys":          [k['name'] for k in GEMINI_KEYS],
+        "gemini_keys_count":    len(GEMINI_KEYS),
+        "SERP_API_KEY_set":     bool(serp),
+        "SERP_API_KEY_prefix":  (serp[:10] + "...") if serp else "YOK",
+        "cooldown_seconds":     COOLDOWN_SECONDS,
+        "firebase_url":         FIREBASE_URL,
     })
 
 
@@ -843,8 +902,6 @@ def chat():
         return Response("Hata: Hiçbir Gemini API key yapılandırılmamış!", status=500)
 
     ip = get_client_ip()
-
-    # ★ Rate limit kontrolü (15 saniyelik cooldown)
     allowed, err = check_rate_limit_chat(ip)
     if not allowed:
         return Response(err, status=429)
@@ -854,7 +911,6 @@ def chat():
         user_name    = request.form.get('user_name', '').strip()
         is_plus      = request.form.get('is_plus', 'false').lower() == 'true'
 
-        # Çoklu görsel kontrolü
         image_files = request.files.getlist('image')
         if not image_files:
             single = request.files.get('image')
@@ -863,11 +919,7 @@ def chat():
         image_files = [f for f in image_files if f and f.filename]
 
         if len(image_files) > MAX_IMAGES:
-            return Response(
-                f"En fazla {MAX_IMAGES} görsel gönderebilirsiniz. "
-                f"Şu an {len(image_files)} görsel gönderildi.",
-                status=400
-            )
+            return Response(f"En fazla {MAX_IMAGES} görsel gönderebilirsiniz.", status=400)
 
         if not user_message and not image_files:
             return Response("Mesaj veya görsel gerekli!", status=400)
@@ -882,31 +934,28 @@ def chat():
             if not ok:
                 return Response(content_err, status=400)
 
-        # Google araştırması
+        # ── SerpAPI Araştırması ──
         research_context = ""
         search_results   = []
         search_performed = False
         search_query     = ""
 
         if user_message and not image_files:
-            raw_search_query = request.form.get('search_query', '').strip()
-            if raw_search_query:
-                do_research, query = needs_research(raw_search_query)
-            else:
-                do_research, query = needs_research(user_message)
+            raw_query = request.form.get('search_query', '').strip()
+            do_research, query = needs_research(raw_query if raw_query else user_message)
 
             if do_research:
-                print(f"[CHAT] Araştırma: '{query[:60]}'")
-                search_results   = google_search(query, num_results=5)
+                print(f"[CHAT] SerpAPI araştırma: '{query[:60]}'")
+                search_results   = serp_search(query, num_results=5)
                 search_performed = True
                 search_query     = query
                 if search_results:
                     research_context = format_search_results_for_ai(search_results, query)
-                    print(f"[CHAT] {len(search_results)} sonuç AI'a verildi")
+                    print(f"[CHAT] {len(search_results)} SerpAPI sonucu AI'a verildi")
                 else:
-                    print("[CHAT] Sonuç yok — AI kendi bilgisinden yanıtlar")
+                    print("[CHAT] SerpAPI sonuç yok — AI kendi bilgisinden yanıtlar")
 
-        # Görsel işleme
+        # ── Görsel İşleme ──
         parts = []
         for img_file in image_files:
             try:
@@ -914,16 +963,12 @@ def chat():
                 if not img_data:
                     return Response(f"Resim dosyası boş: {img_file.filename}", status=400)
                 if len(img_data) / (1024 * 1024) > MAX_IMAGE_SIZE_MB:
-                    return Response(
-                        f"Resim çok büyük: {img_file.filename}. Maks {MAX_IMAGE_SIZE_MB}MB.",
-                        status=400
-                    )
+                    return Response(f"Resim çok büyük. Maks {MAX_IMAGE_SIZE_MB}MB.", status=400)
                 img = Image.open(BytesIO(img_data))
                 img.thumbnail((1024, 1024), Image.LANCZOS)
                 parts.append(img)
-                print(f"[CHAT] Görsel eklendi: {img_file.filename} ({len(img_data)//1024}KB)")
+                print(f"[CHAT] Görsel eklendi: {img_file.filename}")
             except Exception as e:
-                print(f"[CHAT] Görsel hatası ({img_file.filename}): {e}")
                 return Response(f"Resim okunamadı: {img_file.filename}", status=400)
 
         if user_message:
@@ -931,7 +976,7 @@ def chat():
         if not parts:
             return Response("İçerik işlenemedi!", status=400)
 
-        # AI yanıtı
+        # ── AI Yanıtı ──
         system_inst = build_system_instruction(
             user_name=user_name or None,
             is_plus=is_plus,
@@ -942,18 +987,12 @@ def chat():
             ai_text = generate_with_fallback(parts, system_inst)
         except Exception as e:
             print(f"[CHAT] Tüm Gemini keyleri başarısız: {e}")
-            return Response(
-                "Tüm AI servisleri şu an meşgul. Lütfen birkaç dakika sonra tekrar deneyin.",
-                status=503
-            )
+            return Response("Tüm AI servisleri şu an meşgul. Lütfen birkaç dakika sonra tekrar deneyin.", status=503)
 
-        # ★ Başarılı yanıt — cooldown saatini başlat
         register_successful_request(ip)
 
-        # AI metninde ayraç varsa temizle
         ai_text_clean = ai_text.replace(SOURCES_SEPARATOR, "").strip()
 
-        # Sources payload
         sources_payload = {
             "performed": search_performed and len(search_results) > 0,
             "query":     search_query,
@@ -985,14 +1024,14 @@ def manual_search():
         num   = min(int(data.get("num", 5)), 10)
     if not query:
         return jsonify({"error": "q parametresi gerekli"}), 400
-    ip = get_client_ip()
-    allowed, err = check_rate_limit_chat(ip)
-    if not allowed:
-        return Response(err, status=429)
-    results = google_search(query, num_results=num)
-    gk = bool(os.environ.get('GOOGLE_SEARCH_API_KEY', '').strip())
-    cx = bool(os.environ.get('GOOGLE_SEARCH_CX', '').strip())
-    return jsonify({"query": query, "count": len(results), "results": results, "api_configured": gk and cx})
+    results  = serp_search(query, num_results=num)
+    serp_ok  = bool(os.environ.get('SERP_API_KEY', '').strip())
+    return jsonify({
+        "query":           query,
+        "count":           len(results),
+        "results":         results,
+        "serp_configured": serp_ok,
+    })
 
 
 @app.route("/vision", methods=["POST", "OPTIONS"])
@@ -1032,7 +1071,6 @@ def analyze_image():
             result_text = generate_with_fallback(parts, None)
         except Exception as e:
             return Response(f"AI servisi meşgul: {str(e)}", status=503)
-        # ★ Vision için de cooldown başlat
         register_successful_request(ip)
         return Response(result_text, status=200, content_type='text/plain; charset=utf-8')
     except Exception as e:
@@ -1148,7 +1186,7 @@ def admin_get_requests():
     if request.args.get("token") != "KAYAADMIN":
         return Response("Yetkisiz erişim.", status=401)
     records = load_requests()
-    clean = [{k: v for k, v in r.items() if k != '_fb_key'} for r in records]
+    clean   = [{k: v for k, v in r.items() if k != '_fb_key'} for r in records]
     return jsonify(clean)
 
 
@@ -1171,15 +1209,13 @@ def admin_update_request(req_id):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+    serp_ok = bool(os.environ.get('SERP_API_KEY', '').strip())
     print("=" * 55)
     print(f"Math Canavari API v5.0 — Port {port}")
     print(f"Gemini Keys: {len(GEMINI_KEYS)} adet → {[k['name'] for k in GEMINI_KEYS]}")
-    gk = os.environ.get('GOOGLE_SEARCH_API_KEY', '').strip()
-    cx = os.environ.get('GOOGLE_SEARCH_CX', '').strip()
-    print(f"Google Key:  {'✅' if gk else '❌ YOK'}")
-    print(f"Google CX:   {'✅ (' + cx + ')' if cx else '❌ YOK'}")
+    print(f"SerpAPI:     {'✅' if serp_ok else '❌ YOK — SERP_API_KEY ekleyin!'}")
     print(f"Firebase:    {FIREBASE_URL}")
-    print(f"Cooldown:    {COOLDOWN_SECONDS} saniye (mesajlar arası)")
+    print(f"Cooldown:    {COOLDOWN_SECONDS} saniye")
     print(f"Max Görsel:  {MAX_IMAGES} adet")
     print("=" * 55)
     app.run(host='0.0.0.0', port=port, debug=False)
