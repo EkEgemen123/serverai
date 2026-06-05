@@ -66,7 +66,7 @@ if not GEMINI_KEYS:
 else:
     print(f"✅ Toplam {len(GEMINI_KEYS)} Gemini API key hazır.")
 
-MODEL_NAME   = "gemini-2.5-flash"
+MODEL_NAME   = "gemini-3.5-flash"
 SERP_API_URL = "https://serpapi.com/search.json"
 
 # ========================= FİREBASE REALTIME DATABASE =========================
